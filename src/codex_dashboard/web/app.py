@@ -1,0 +1,427 @@
+from __future__ import annotations
+
+import logging
+import statistics
+import threading
+from contextlib import asynccontextmanager
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from urllib.parse import urlencode
+
+from fastapi import FastAPI, Form, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.templating import Jinja2Templates
+
+from ..config import Settings
+from ..db import database, initialize
+from ..ingestion.scanner import ingest
+from ..pricing import seed_prices
+from ..reports import format_cost, format_duration, format_tokens, iso_date, session_detail, session_rows
+
+log = logging.getLogger(__name__)
+TEMPLATE_DIR = Path(__file__).with_name("templates")
+MODEL_STYLES = {
+    "gpt-5.6-sol": "sol",
+    "gpt-5.6-terra": "terra",
+    "gpt-5.6-luna": "luna",
+    "gpt-6-astra": "astra",
+}
+SESSION_SORT_KEYS = (
+    "started", "title", "project", "root_model", "models", "agents", "input",
+    "cached", "output", "total", "cost", "duration",
+)
+SESSION_SORT_LABELS = {
+    "started": "Started", "title": "Task / title", "project": "Project",
+    "root_model": "Root model", "models": "Models used", "agents": "Agents",
+    "input": "Input", "cached": "Cached", "output": "Output", "total": "Total",
+    "cost": "Cost", "duration": "Duration",
+}
+TEXT_SESSION_SORTS = {"title", "project", "root_model", "models"}
+
+
+def _model_style(model: str) -> str:
+    return MODEL_STYLES.get(model, "other")
+
+
+def _model_composition(rows: list[Any]) -> dict[str, Any]:
+    entries = []
+    for row in rows:
+        entries.append(
+            {
+                "model": row["model"],
+                "style": _model_style(row["model"]),
+                "cost": float(
+                    (row["cost_usd"] if "cost_usd" in row.keys() else row["known_cost_usd"])
+                    or 0
+                ),
+                "tokens": int(row["total_tokens"] or 0),
+                "calls": int(row["usage_events"] or 0),
+                "unknown_cost_records": int(row["unknown_cost_records"] or 0),
+            }
+        )
+    totals = {
+        "cost": sum(entry["cost"] for entry in entries),
+        "tokens": sum(entry["tokens"] for entry in entries),
+        "calls": sum(entry["calls"] for entry in entries),
+    }
+    return {"entries": entries, **totals}
+
+
+def _sort_links(request: Request, current_sort: str, current_direction: str) -> dict[str, str]:
+    base = [
+        (key, value) for key, value in request.query_params.multi_items()
+        if key not in {"sort", "direction"}
+    ]
+    links = {}
+    for key in SESSION_SORT_KEYS:
+        if key == current_sort:
+            next_direction = "desc" if current_direction == "asc" else "asc"
+        else:
+            next_direction = "asc" if key in TEXT_SESSION_SORTS else "desc"
+        links[key] = "?" + urlencode([*base, ("sort", key), ("direction", next_direction)])
+    return links
+
+
+def _period_boundary(period: str, now: datetime | None = None) -> str | None:
+    local_now = (now or datetime.now().astimezone()).astimezone()
+    if period == "all":
+        return None
+    if period == "today":
+        start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "month":
+        start = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif period == "7d":
+        start = local_now - timedelta(days=7)
+    else:
+        start = local_now - timedelta(days=30)
+    return start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _period_clause(period: str) -> tuple[str, tuple[Any, ...]]:
+    boundary = _period_boundary(period)
+    return ("1=1", ()) if boundary is None else ("julianday(u.timestamp)>=julianday(?)", (boundary,))
+
+
+def _session_period(period: str) -> tuple[str, tuple[Any, ...]]:
+    boundary = _period_boundary(period)
+    if boundary is None:
+        return "EXISTS(SELECT 1 FROM usage up WHERE up.session_id=s.id)", ()
+    return (
+        "EXISTS(SELECT 1 FROM usage up WHERE up.session_id=s.id AND julianday(up.timestamp)>=julianday(?))",
+        (boundary,),
+    )
+
+
+def _overview(conn, period: str, sort: str = "started", direction: str = "desc") -> dict[str, Any]:
+    usage_where, usage_params = _period_clause(period)
+    usage = conn.execute(
+        f"""SELECT COALESCE(SUM(total_tokens),0) tokens,COALESCE(SUM(input_tokens),0) input_tokens,
+            COALESCE(SUM(cached_input_tokens),0) cached_tokens,SUM(CAST(cost_usd AS REAL)) known_cost,
+            SUM(cost_usd IS NULL) unknown_cost_records,COUNT(DISTINCT session_id) sessions,
+            COUNT(DISTINCT thread_id) agents FROM usage u WHERE {usage_where}""",
+        usage_params,
+    ).fetchone()
+    session_where, session_params = _session_period(period)
+    rows = session_rows(
+        conn, where=session_where, params=session_params, order=sort, direction=direction
+    )
+    incomplete_sessions = sum(1 for row in rows if row["accounting_status"] != "complete")
+    known_session_costs = [
+        float(r[0] or 0) for r in conn.execute(
+            f"""SELECT SUM(CAST(cost_usd AS REAL)) FROM usage u WHERE {usage_where}
+                GROUP BY session_id HAVING SUM(cost_usd IS NULL)=0""",
+            usage_params,
+        ).fetchall()
+    ]
+    subagents = sum(max(0, int(r["agent_count"]) - 1) for r in rows)
+    models = conn.execute(
+        f"""SELECT model,COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
+            SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
+            SUM(output_tokens) output_tokens,SUM(total_tokens) total_tokens,COUNT(*) usage_events,
+            SUM(CAST(cost_usd AS REAL)) cost_usd,SUM(cost_usd IS NULL) unknown_cost_records
+            FROM usage u WHERE {usage_where} GROUP BY model ORDER BY cost_usd DESC""",
+        usage_params,
+    ).fetchall()
+    total_known = float(usage["known_cost"] or 0)
+    most_used = max(models, key=lambda r: r["total_tokens"] or 0)["model"] if models else "unknown"
+    most_expensive = max(models, key=lambda r: r["cost_usd"] or 0)["model"] if models else "unknown"
+    return {
+        "tokens": usage["tokens"], "input_tokens": usage["input_tokens"],
+        "cached_tokens": usage["cached_tokens"], "known_cost": total_known,
+        "unknown_cost_records": (usage["unknown_cost_records"] or 0) + incomplete_sessions,
+        "sessions": len(rows), "agents": usage["agents"], "subagents": subagents,
+        "average": statistics.fmean(known_session_costs) if known_session_costs else 0,
+        "median": statistics.median(known_session_costs) if known_session_costs else 0,
+        "cached_pct": 100 * usage["cached_tokens"] / usage["input_tokens"] if usage["input_tokens"] else 0,
+        "most_used": most_used, "most_expensive": most_expensive,
+        "models": models, "model_composition": _model_composition(models),
+        "total_known": total_known, "session_rows": rows[:30],
+    }
+
+
+def _svg_trend(rows: list[Any], width: int = 900, height: int = 190) -> str:
+    if not rows:
+        return '<svg viewBox="0 0 900 190" role="img"><text x="20" y="95">No usage in this period</text></svg>'
+    values = [float(r[1] or 0) for r in rows]
+    maximum = max(values) or 1
+    left, top, bottom = 48, 12, 32
+    plot_w, plot_h = width - left - 12, height - top - bottom
+    step = plot_w / max(1, len(rows) - 1)
+    points = " ".join(
+        f"{left + i * step:.1f},{top + plot_h - value / maximum * plot_h:.1f}"
+        for i, value in enumerate(values)
+    )
+    labels = "".join(
+        f'<text x="{left + i * step:.1f}" y="{height - 8}" text-anchor="middle">{row[0][5:]}</text>'
+        for i, row in enumerate(rows) if i in {0, len(rows) - 1} or len(rows) <= 8
+    )
+    return (
+        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Daily spend trend">'
+        f'<line x1="{left}" y1="{top+plot_h}" x2="{width-12}" y2="{top+plot_h}" class="axis"/>'
+        f'<polyline points="{points}" class="trend-line"/>'
+        f'<text x="4" y="20">${maximum:.2f}</text>{labels}</svg>'
+    )
+
+
+def create_app(settings: Settings | None = None, *, ingest_interval: float = 10) -> FastAPI:
+    settings = settings or Settings.load()
+    settings.validate()
+    initialize(settings.database)
+    with database(settings.database) as conn:
+        seed_prices(conn)
+    def refresh() -> None:
+        try:
+            ingest(settings)
+        except Exception:
+            log.exception("Background ingestion failed")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        stop = threading.Event()
+
+        def loop() -> None:
+            while not stop.is_set():
+                refresh()
+                stop.wait(max(1, ingest_interval))
+
+        task = threading.Thread(target=loop, name="codex-dashboard-ingest", daemon=True)
+        task.start()
+        yield
+        stop.set()
+        task.join(timeout=5)
+        if task.is_alive():
+            log.warning("Background ingestion did not stop within five seconds")
+
+    app = FastAPI(title="Codex Usage Dashboard", lifespan=lifespan)
+    app.state.settings = settings
+    templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+    templates.env.filters.update(
+        tokens=format_tokens, cost=format_cost, duration=format_duration, isodate=iso_date,
+        modelstyle=_model_style,
+    )
+
+    def render(request: Request, name: str, **context):
+        return templates.TemplateResponse(request=request, name=name, context={"request": request, **context})
+
+    @app.get("/", response_class=HTMLResponse)
+    def home(
+        request: Request, period: str = "30d", sort: str = "started", direction: str = "desc"
+    ):
+        sort = sort if sort in SESSION_SORT_KEYS else "started"
+        direction = "asc" if direction == "asc" else "desc"
+        with database(settings.database, readonly=True) as conn:
+            overview = _overview(conn, period, sort, direction)
+            usage_where, usage_params = _period_clause(period)
+            daily = conn.execute(
+                f"SELECT date(timestamp,'localtime'),SUM(CAST(cost_usd AS REAL)) FROM usage u WHERE {usage_where} "
+                "GROUP BY date(timestamp,'localtime') ORDER BY date(timestamp,'localtime')",
+                usage_params,
+            ).fetchall()
+        return render(
+            request, "home.html", active="home", period=period, data=overview,
+            trend=_svg_trend(daily), refresh=10, sort_key=sort, sort_direction=direction,
+            sort_links=_sort_links(request, sort, direction),
+        )
+
+    @app.get("/sessions", response_class=HTMLResponse)
+    def sessions_page(
+        request: Request, sort: str = "started", direction: str = "desc",
+        start: str | None = None, end: str | None = None,
+        project: str | None = None, model: str | None = None, root_model: str | None = None,
+        contains_astra: bool = False, subagents: bool = False, min_cost: float | None = None,
+    ):
+        sort = sort if sort in SESSION_SORT_KEYS else "started"
+        direction = "asc" if direction == "asc" else "desc"
+        clauses, params = ["1=1"], []
+        if start: clauses.append("date(s.created_at,'localtime')>=date(?)"); params.append(start)
+        if end: clauses.append("date(s.created_at,'localtime')<=date(?)"); params.append(end)
+        if project: clauses.append("COALESCE(s.repo_name,s.cwd)=?"); params.append(project)
+        if model: clauses.append("EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id AND uf.model=?)"); params.append(model)
+        if root_model: clauses.append("s.root_model=?"); params.append(root_model)
+        if contains_astra: clauses.append("EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id AND uf.model='gpt-6-astra')")
+        if subagents: clauses.append("EXISTS(SELECT 1 FROM agents af WHERE af.session_id=s.id AND af.parent_thread_id IS NOT NULL)")
+        if min_cost is not None:
+            clauses.append("COALESCE((SELECT SUM(CAST(cost_usd AS REAL)) FROM usage uf WHERE uf.session_id=s.id),0)>=?")
+            params.append(min_cost)
+        with database(settings.database, readonly=True) as conn:
+            rows = session_rows(
+                conn, where=" AND ".join(clauses), params=tuple(params), order=sort,
+                direction=direction,
+            )
+            projects = [r[0] for r in conn.execute("SELECT DISTINCT COALESCE(repo_name,cwd) FROM sessions WHERE COALESCE(repo_name,cwd) IS NOT NULL ORDER BY 1")]
+            models = [r[0] for r in conn.execute("SELECT DISTINCT model FROM usage ORDER BY model")]
+            roots = [r[0] for r in conn.execute("SELECT DISTINCT root_model FROM sessions WHERE root_model IS NOT NULL ORDER BY root_model")]
+        return render(
+            request, "sessions.html", active="sessions", rows=rows, projects=projects,
+            models=models, roots=roots, sort_key=sort, sort_direction=direction,
+            sort_links=_sort_links(request, sort, direction), sort_labels=SESSION_SORT_LABELS,
+        )
+
+    @app.get("/sessions/{session_id}", response_class=HTMLResponse)
+    def session_page(request: Request, session_id: str):
+        with database(settings.database, readonly=True) as conn:
+            session = session_detail(conn, session_id)
+            agents = conn.execute(
+                """SELECT a.*,COUNT(u.id) usage_events,COALESCE(SUM(u.input_tokens),0) input_tokens,
+                   COALESCE(SUM(u.cached_input_tokens),0) cached_input_tokens,COALESCE(SUM(u.output_tokens),0) output_tokens,
+                   COALESCE(SUM(u.reasoning_output_tokens),0) reasoning_tokens,COALESCE(SUM(u.total_tokens),0) total_tokens,
+                   SUM(CAST(u.cost_usd AS REAL)) known_cost_usd,SUM(u.id IS NOT NULL AND u.cost_usd IS NULL) unknown_cost_records,
+                   CAST(strftime('%s',COALESCE(MAX(u.timestamp),a.updated_at))-strftime('%s',COALESCE(MIN(u.timestamp),a.created_at)) AS INTEGER) duration_seconds,
+                   GROUP_CONCAT(DISTINCT u.model) models_used
+                   FROM agents a LEFT JOIN usage u ON u.thread_id=a.thread_id WHERE a.session_id=?
+                   GROUP BY a.thread_id ORDER BY COALESCE(a.agent_path,'/root'),a.created_at""",
+                (session_id,),
+            ).fetchall()
+            model_rows = conn.execute(
+                """SELECT model,COUNT(DISTINCT thread_id) agents,COUNT(*) usage_events,SUM(input_tokens) input_tokens,
+                   SUM(cached_input_tokens) cached_input_tokens,SUM(output_tokens) output_tokens,
+                   SUM(reasoning_output_tokens) reasoning_tokens,SUM(total_tokens) total_tokens,
+                   SUM(CAST(cost_usd AS REAL)) known_cost_usd,SUM(cost_usd IS NULL) unknown_cost_records
+                   FROM usage WHERE session_id=? GROUP BY model ORDER BY known_cost_usd DESC""",
+                (session_id,),
+            ).fetchall()
+            event_rows = conn.execute(
+                "SELECT * FROM usage WHERE session_id=? ORDER BY timestamp,source_ordinal LIMIT 500", (session_id,)
+            ).fetchall()
+            tags = [r[0] for r in conn.execute(
+                "SELECT t.name FROM tags t JOIN session_tags st ON st.tag_id=t.id WHERE st.session_id=? ORDER BY t.name",
+                (session_id,),
+            )]
+        if session is None:
+            return HTMLResponse("Session not found", status_code=404)
+        agent_rows = []
+        for agent in agents:
+            data = dict(agent)
+            path = data.get("agent_path") or ("/root" if not data.get("parent_thread_id") else "/root/subagent")
+            data["depth"] = max(0, path.strip("/").count("/"))
+            agent_rows.append(data)
+        events = []
+        for number, event in enumerate(event_rows, 1):
+            data = dict(event)
+            marker = f"Call #{number:03d}" if data.get("response_id") else f"Usage event #{number:03d}"
+            data["call_label"] = f"{marker} · {data['call_label']}" if data.get("call_label") else marker
+            data["full_identity"] = data.get("response_id") or data["source_record_identity"]
+            events.append(data)
+        return render(
+            request, "session.html", active="sessions", session=session, agents=agent_rows,
+            models=model_rows, model_composition=_model_composition(model_rows), events=events,
+            tags=tags, refresh=10 if session["status"] == "running" else None,
+        )
+
+    @app.post("/sessions/{session_id}/tags")
+    def update_tags(session_id: str, tags: str = Form("")):
+        names = sorted({part.strip() for part in tags.split(",") if part.strip()})
+        with database(settings.database) as conn:
+            conn.execute("DELETE FROM session_tags WHERE session_id=?", (session_id,))
+            for name in names:
+                conn.execute("INSERT OR IGNORE INTO tags(name) VALUES(?)", (name,))
+                conn.execute("INSERT INTO session_tags SELECT ?,id FROM tags WHERE name=?", (session_id, name))
+        return RedirectResponse(f"/sessions/{session_id}", status_code=303)
+
+    @app.get("/models", response_class=HTMLResponse)
+    def models_page(request: Request):
+        with database(settings.database, readonly=True) as conn:
+            rows = conn.execute(
+                """SELECT model,provider,COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
+                   COUNT(*) usage_events,
+                   SUM(total_tokens) total_tokens,SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
+                   SUM(CAST(cost_usd AS REAL)) known_cost_usd,SUM(cost_usd IS NULL) unknown_cost_records,
+                   SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
+                   FROM usage GROUP BY model,provider ORDER BY known_cost_usd DESC"""
+            ).fetchall()
+            daily = conn.execute(
+                """SELECT date(timestamp,'localtime'),model,SUM(CAST(cost_usd AS REAL)),SUM(cost_usd IS NULL)
+                   FROM usage GROUP BY date(timestamp,'localtime'),model ORDER BY 1,2"""
+            ).fetchall()
+        return render(
+            request, "models.html", active="models", rows=rows, daily=daily,
+            model_composition=_model_composition(rows),
+        )
+
+    @app.get("/projects", response_class=HTMLResponse)
+    def projects_page(request: Request):
+        with database(settings.database, readonly=True) as conn:
+            rows = conn.execute(
+                """SELECT COALESCE(s.repo_name,s.cwd,'unknown') project,COUNT(DISTINCT s.id) sessions,
+                   SUM(u.total_tokens) total_tokens,SUM(CAST(u.cost_usd AS REAL)) known_cost_usd,
+                   SUM(u.cost_usd IS NULL) unknown_cost_records,
+                   SUM(CAST(u.cost_usd AS REAL))/COUNT(DISTINCT s.id) average_cost,
+                   100.0*SUM(CASE WHEN u.model='gpt-5.6-sol' THEN CAST(u.cost_usd AS REAL) ELSE 0 END)/NULLIF(SUM(CAST(u.cost_usd AS REAL)),0) sol_pct,
+                   100.0*SUM(CASE WHEN u.model='gpt-5.6-terra' THEN CAST(u.cost_usd AS REAL) ELSE 0 END)/NULLIF(SUM(CAST(u.cost_usd AS REAL)),0) terra_pct,
+                   100.0*SUM(CASE WHEN u.model='gpt-5.6-luna' THEN CAST(u.cost_usd AS REAL) ELSE 0 END)/NULLIF(SUM(CAST(u.cost_usd AS REAL)),0) luna_pct,
+                   100.0*SUM(CASE WHEN u.model='gpt-6-astra' THEN CAST(u.cost_usd AS REAL) ELSE 0 END)/NULLIF(SUM(CAST(u.cost_usd AS REAL)),0) astra_pct
+                   FROM sessions s LEFT JOIN usage u ON u.session_id=s.id GROUP BY project ORDER BY known_cost_usd DESC"""
+            ).fetchall()
+        return render(request, "projects.html", active="projects", rows=rows)
+
+    @app.get("/trends", response_class=HTMLResponse)
+    def trends_page(request: Request):
+        with database(settings.database, readonly=True) as conn:
+            daily = conn.execute(
+                """SELECT date(timestamp,'localtime') period,SUM(CAST(cost_usd AS REAL)) cost,
+                   SUM(total_tokens) tokens,COUNT(DISTINCT session_id) sessions,
+                   SUM(cost_usd IS NULL) unknown_cost_records,
+                   100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
+                   SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
+                   FROM usage GROUP BY date(timestamp,'localtime') ORDER BY period"""
+            ).fetchall()
+            weekly = conn.execute(
+                """SELECT strftime('%Y-W%W',timestamp,'localtime') period,SUM(CAST(cost_usd AS REAL)) cost,
+                   SUM(total_tokens) tokens,COUNT(DISTINCT session_id) sessions,
+                   SUM(cost_usd IS NULL) unknown_cost_records,
+                   100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
+                   SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
+                   FROM usage GROUP BY strftime('%Y-W%W',timestamp,'localtime') ORDER BY period"""
+            ).fetchall()
+            by_model = conn.execute(
+                """SELECT date(timestamp,'localtime') period,model,SUM(CAST(cost_usd AS REAL)) cost,
+                   SUM(total_tokens) tokens,SUM(cost_usd IS NULL) unknown_cost_records
+                   FROM usage GROUP BY date(timestamp,'localtime'),model ORDER BY period,model"""
+            ).fetchall()
+        return render(request, "trends.html", active="trends", daily=daily, weekly=weekly,
+                      by_model=by_model, spend_svg=_svg_trend(daily))
+
+    @app.get("/compare", response_class=HTMLResponse)
+    def compare_page(request: Request, session: list[str] = Query(default=[])):
+        selected = session[:4]
+        with database(settings.database, readonly=True) as conn:
+            rows = [session_detail(conn, sid) for sid in selected]
+            rows = [r for r in rows if r]
+            model_costs = {
+                sid: {r[0]: (r[1], r[2]) for r in conn.execute(
+                    """SELECT model,SUM(CAST(cost_usd AS REAL)),SUM(cost_usd IS NULL)
+                       FROM usage WHERE session_id=? GROUP BY model""", (sid,)
+                )} for sid in selected
+            }
+        return render(request, "compare.html", active="compare", rows=rows, model_costs=model_costs)
+
+    @app.get("/healthz")
+    def health():
+        return {"status": "ok", "database": str(settings.database), "codex_home": str(settings.codex_home)}
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon():
+        return Response(status_code=204)
+
+    return app

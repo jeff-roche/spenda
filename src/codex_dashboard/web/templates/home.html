@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block title %}Codex usage overview{% endblock %}
+{% block content %}
+<h1>How much am I spending on Codex?</h1>
+<div class="periods">{% for key,label in [('today','Today'),('7d','7 days'),('30d','30 days'),('month','This month'),('all','All time')] %}<a class="{{ 'selected' if period==key }}" href="/?period={{ key }}">{{ label }}</a>{% endfor %}</div>
+<div class="cards">
+ <div class="card"><h3>Total USD</h3><div class="metric">{{ data.known_cost|cost(data.unknown_cost_records) }}</div></div>
+ <div class="card"><h3>Total tokens</h3><div class="metric">{{ data.tokens|tokens }}</div></div>
+ <div class="card"><h3>Tasks</h3><div class="metric">{{ data.sessions }}</div></div>
+ <div class="card"><h3>Subagents</h3><div class="metric">{{ data.subagents }}</div></div>
+ <div class="card"><h3>Average / task</h3><div class="metric">{{ data.average|cost }}</div></div>
+ <div class="card"><h3>Median / task</h3><div class="metric">{{ data.median|cost }}</div></div>
+ <div class="card"><h3>Cached input</h3><div class="metric">{{ '%.1f'|format(data.cached_pct) }}%</div></div>
+ <div class="card"><h3>Most used</h3><div class="metric" style="font-size:16px">{{ data.most_used }}</div></div>
+ <div class="card"><h3>Most expensive</h3><div class="metric {{ 'astra' if data.most_expensive=='gpt-6-astra' }}" style="font-size:16px">{{ data.most_expensive }}</div></div>
+</div>
+<h2>Spend over time</h2><div class="chart">{{ trend|safe }}</div>
+<h2>Model composition</h2>{% set model_composition=data.model_composition %}{% include "_model_composition.html" %}
+<h2>Model breakdown</h2><div class="table-wrap"><table><thead><tr><th class="left">Model</th><th>Sessions</th><th>Agents</th><th>Calls</th><th>Input</th><th>Cached</th><th>Output</th><th>Cost</th><th>% known cost</th></tr></thead><tbody>
+{% for row in data.models %}<tr><td class="left model-name model-{{ row.model|modelstyle }}-text">{{ row.model }}</td><td>{{ row.sessions }}</td><td>{{ row.agents }}</td><td>{{ row.usage_events }}</td><td>{{ row.input_tokens|tokens }}</td><td>{{ row.cached_input_tokens|tokens }}</td><td>{{ row.output_tokens|tokens }}</td><td>{{ row.cost_usd|cost(row.unknown_cost_records) }}</td><td>{% if data.total_known %}{{ '%.1f'|format(100*(row.cost_usd or 0)/data.total_known) }}%{% else %}—{% endif %}</td></tr>{% endfor %}
+</tbody></table></div>
+<h2>Recent tasks</h2>{% set rows=data.session_rows %}{% set selectable=false %}{% include "_sessions_table.html" %}
+{% endblock %}

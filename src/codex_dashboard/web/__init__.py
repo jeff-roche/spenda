@@ -1,0 +1,2 @@
+"""Server-rendered web dashboard."""
+

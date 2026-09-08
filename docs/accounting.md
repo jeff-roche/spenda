@@ -1,0 +1,109 @@
+# Accounting method
+
+This document describes how every displayed dollar total can be reproduced from normalized `usage` rows and effective-dated `prices` rows.
+
+## 1. Counted events
+
+The preferred source is `token_usage_record.payload.usage`, which is an atomic response-level counter and has a stable `response_id`.
+
+When no matching atomic record exists, `event_msg/token_count` is the fallback. The first snapshot uses `last_token_usage` (or the cumulative value if last usage is absent). Later records count the categorized monotonic delta in `total_token_usage`. This is necessary because older Codex UI events sometimes repeat the same `last_token_usage` at a new timestamp while the cumulative snapshot remains unchanged. An unchanged snapshot is ignored. A counter decrease is treated as a reset: the per-response value is counted when available and a `counter_reset` warning is stored.
+
+Every normalized row recomputes `total_tokens = input_tokens + output_tokens`. Legacy UI records with zero input/output/cache/reasoning categories and only a stale nonzero `total_tokens` are ignored.
+
+## 2. Ignored events
+
+- cumulative `turn_token_usage`, `thread_token_usage`, and `total_token_usage` are never summed; atomic thread totals are also never used as the baseline for the separate full-history UI cumulative counter;
+- a `token_count` identical to the immediately preceding atomic usage record is a duplicate UI representation and is ignored;
+- rate-limit-only token events with `info: null` are ignored;
+- prompts, response bodies, reasoning bodies, tool arguments/output, patches, world state, and unknown event kinds are ignored;
+- `threads.tokens_used` is diagnostic only and is not another usage record.
+
+The parser may retain one fixed, non-content action label alongside a usage row when adjacent persisted metadata identifies the response as a test run, file change, image inspection, command, file search/read, web search, assistant update, or final response. It does not retain the command, filenames, message text, arguments, or output. When the association is ambiguous, the label remains null and the UI shows only its sequential call marker.
+
+## 3. Incremental versus cumulative semantics
+
+`payload.usage` and `last_token_usage` are treated as incremental per-response records. The dashboard stores one normalized row per response/fallback event. Cumulative snapshots are retained only in ingestion state so a legacy delta can be computed; they are not copied into the usage ledger.
+
+Incremental import stores the last complete byte offset and parser context. Re-reading, rescanning with `--all`, archive moves, and process restarts are safe because `usage.source_record_identity` is unique. Atomic identities use `response_id`; fallbacks hash stable source fields. A partial final line does not advance the offset.
+
+If a parent edge appears after a child was imported, the child subtree and its existing usage ledger rows are reassigned to the resolved root in the same ingestion transaction. A missing referenced rollout marks the task accounting as partial or unavailable; its state-level token counter is reported as an evidence gap and is not converted into model or cost records.
+
+## 4. Input and cached tokens
+
+Observed Codex records show that `input_tokens` includes both cached-input and cache-write subsets. The normalized row computes:
+
+```text
+uncached_input_tokens = max(
+    0,
+    input_tokens - cached_input_tokens - cache_write_input_tokens
+)
+```
+
+For older records without a cache-write field, cache write is zero and `input - cached` is billed at the ordinary input rate.
+
+## 5. Reasoning tokens
+
+Observed `reasoning_output_tokens` is a subset of `output_tokens`, while `total_tokens = input_tokens + output_tokens`. Reasoning is displayed separately for analysis, but output is charged once:
+
+```text
+output_cost = output_tokens × output_price
+```
+
+Reasoning tokens are never added to output or total tokens a second time.
+
+## 6. Model attribution
+
+Each usage record is attributed to the most recent `turn_context.payload.model` in that rollout. This supports thread-level model differences and model changes between turns. The state database's thread model is metadata/fallback, not proof that every response used that model. If no active model context exists, the record is stored as `unknown-model`; it is never assigned to the root model.
+
+Provider is preserved. Built-in OpenAI API prices apply only to provider `openai`. Azure or other providers need their own explicit price records.
+
+## 7. Root and subagent attribution
+
+`thread_spawn_edges` is primary. Top-level rollout `session_meta.parent_thread_id`, structured `session_meta.source.subagent.thread_spawn.parent_thread_id`, and root `session_meta.session_id` fill absent state edges/grouping. Following parent IDs recursively assigns nested descendants to the stable root thread ID, which is also the dashboard task ID. `agent_path`, nickname, role, and depth are retained where present.
+
+Rows marked as subagents but lacking a parent ID are marked orphaned. They are not linked to a root based only on timestamps.
+
+## 8. Price selection and formulas
+
+The event timestamp selects the row whose:
+
+```text
+model and provider match
+effective_from <= timestamp
+effective_until is null or timestamp < effective_until
+```
+
+Aliases are explicit in `model_aliases`. Unknown names are not silently mapped.
+
+For an ordinary-context request:
+
+```text
+uncached_input_usd = uncached_input_tokens × input_per_million / 1,000,000
+cached_input_usd = cached_input_tokens × cached_input_per_million / 1,000,000
+cache_write_usd = cache_write_input_tokens × cache_write_per_million / 1,000,000
+output_usd = output_tokens × output_per_million / 1,000,000
+cost_usd = sum(the four components)
+```
+
+Official OpenAI model pages inspected on 2026-09-08 state that GPT-5.6 and GPT-6 Astra cache writes cost 1.25 times uncached input. Their prompts above 272,000 input tokens use 2× input/cache rates and 1.5× output for the full request. Because accounting is response-atomic, these multipliers are applied using that response's `input_tokens`.
+
+Built-in sources:
+
+- <https://developers.openai.com/api/docs/models/gpt-6-astra>
+- <https://developers.openai.com/api/docs/models/gpt-5.6-sol>
+- <https://developers.openai.com/api/docs/models/gpt-5.6-terra>
+- <https://developers.openai.com/api/docs/models/gpt-5.6-luna>
+- <https://developers.openai.com/api/docs/models/gpt-5.5>
+- <https://developers.openai.com/api/docs/models/gpt-5.4>
+- <https://developers.openai.com/api/docs/models/gpt-5.4-mini>
+- <https://developers.openai.com/api/docs/models/gpt-5.4-pro>
+
+The first built-in capture is versioned, but the 2026-07-01 effective start for the GPT-5.6 family is a **local-history coverage floor**, not a claim that the public price was first effective that day. It covers locally observed GPT-5.6 records beginning in July using the price verified on 2026-09-08. If authoritative older pricing differs, add an earlier row/boundary and rebuild. Astra begins at the actual capture date because no earlier local Astra usage was observed.
+
+## 9. Unknown and omitted billing dimensions
+
+If no price row matches, all component costs and `cost_usd` are null. Reports omit those records from dollar totals; a group containing only unpriced records is displayed as `$0.0000`.
+
+Normal persistence did not expose all possible server billing dimensions. The MVP does not estimate tool-call fees, Batch/Flex/Fast service tiers, regional-processing uplifts, credits, taxes, or server-side adjustments. It also cannot distinguish every historical cache-write billing policy when an older model page does not publish a write rate; built-in older-model rows conservatively use the normal input rate for writes.
+
+Local totals should be reconciled with OpenAI organization Usage/Costs APIs or invoices in a future optional feature. Those APIs are not required by this dashboard.

@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import subprocess
+import sys
+import time
+from decimal import Decimal
+from pathlib import Path
+
+from . import __version__
+from .config import Settings
+from .db import database, initialize
+from .ingestion.codex_state import read_state
+from .ingestion.scanner import discover_rollouts, ingest
+from .pricing import add_price, reprice_usage, seed_prices
+from .reports import as_dict, format_cost, format_tokens, iso_date, session_rows
+
+log = logging.getLogger("codex_dashboard")
+
+
+def _add_config(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--codex-home", help="Codex state directory (default: CODEX_HOME or ~/.codex)")
+    parser.add_argument("--database", help="Dashboard-owned SQLite database")
+    parser.add_argument("--no-preview", action="store_true", help="Do not persist first-message previews")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="codex-dashboard")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("-v", "--verbose", action="count", default=0)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    for name, help_text in (
+        ("doctor", "Inspect Codex and dashboard data sources"),
+        ("sessions", "List normalized task sessions"),
+        ("prices", "List historical model prices"),
+    ):
+        cmd = sub.add_parser(name, help=help_text)
+        _add_config(cmd)
+    sessions = sub.choices["sessions"]
+    sessions.add_argument("--limit", type=int, default=30)
+    sessions.add_argument("--sort", choices=("time", "cost", "tokens", "duration", "agents"), default="time")
+
+    ingest_p = sub.add_parser("ingest", help="Ingest new or changed ordinary Codex state")
+    _add_config(ingest_p)
+    ingest_p.add_argument("--all", action="store_true", help="Rescan complete files; deduplication remains active")
+
+    watch = sub.add_parser("watch", help="Continuously ingest ordinary Codex state")
+    _add_config(watch)
+    watch.add_argument("--interval", type=float, default=10)
+
+    serve = sub.add_parser("serve", help="Serve the local dashboard")
+    _add_config(serve)
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--interval", type=float, default=10)
+
+    export = sub.add_parser("export", help="Export normalized session accounting")
+    _add_config(export)
+    export.add_argument("--format", choices=("csv", "json"), required=True)
+    export.add_argument("--breakdown", choices=("sessions", "models"), default="sessions")
+    export.add_argument("--output", "-o", default="-")
+
+    rebuild = sub.add_parser("rebuild", help="Reimport derived data while preserving dashboard metadata")
+    _add_config(rebuild)
+    rebuild.add_argument("--yes", action="store_true", help="Confirm dashboard database deletion")
+
+    price = sub.add_parser("price-add", help="Add a historical price row")
+    _add_config(price)
+    price.add_argument("model")
+    price.add_argument("effective_from")
+    price.add_argument("--provider", default="openai")
+    price.add_argument("--input", required=True)
+    price.add_argument("--cached-input", required=True)
+    price.add_argument("--cache-write", required=True)
+    price.add_argument("--output-price", required=True)
+    price.add_argument("--effective-until")
+    price.add_argument("--source", required=True)
+    price.add_argument("--notes")
+
+    tag = sub.add_parser("tag", help="Replace tags on a dashboard session")
+    _add_config(tag)
+    tag.add_argument("session_id")
+    tag.add_argument("tags", nargs="*", help="Tag names")
+    return parser
+
+
+def _settings(args: argparse.Namespace) -> Settings:
+    return Settings.load(args.codex_home, args.database, not args.no_preview)
+
+
+def _prepare(settings: Settings) -> None:
+    settings.validate()
+    initialize(settings.database)
+    with database(settings.database) as conn:
+        seed_prices(conn)
+
+
+def _print_ingest(summary) -> None:
+    print(f"Scanned: {summary.scanned_files} rollout files")
+    print(f"Root sessions: {summary.root_sessions}")
+    print(f"Subagent sessions: {summary.subagent_sessions}")
+    print(f"Usage records added: {summary.usage_records}")
+    print(f"Duplicate records ignored: {summary.duplicate_records}")
+    print(f"Unknown models: {', '.join(sorted(summary.unknown_models)) or '0'}")
+    print(f"Unknown prices: {', '.join(sorted(summary.unknown_prices)) or '0'}")
+    print(f"Estimated spend added: ${summary.estimated_spend:.4f}")
+    if summary.parser_warnings or summary.malformed_lines:
+        print(f"Parser warnings: {summary.parser_warnings}; malformed lines: {summary.malformed_lines}")
+
+
+def _codex_version() -> str:
+    try:
+        result = subprocess.run(
+            ["codex", "--version"], capture_output=True, text=True, timeout=5, check=False
+        )
+        return (result.stdout or result.stderr).strip().splitlines()[-1]
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+
+
+def _auth_mode(codex_home: Path) -> str:
+    try:
+        data = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+        value = data.get("auth_mode")
+        return value if isinstance(value, str) else "unknown"
+    except (OSError, json.JSONDecodeError):
+        return "unknown"
+
+
+def doctor(settings: Settings) -> int:
+    _prepare(settings)
+    snapshot = read_state(settings.codex_home)
+    rollouts = discover_rollouts(settings.codex_home)
+    roots = len(snapshot.threads) - len(snapshot.edges)
+    models = sorted({str(t.get("model")) for t in snapshot.threads if t.get("model")})
+    print(f"Codex home: {settings.codex_home}")
+    print(f"Codex version: {_codex_version()}")
+    auth_mode = _auth_mode(settings.codex_home)
+    print(f"Codex auth mode: {auth_mode}")
+    if auth_mode not in {"apikey", "unknown"}:
+        print("Auth warning: this MVP estimates API-key usage only; ChatGPT quota is not implemented")
+    print(f"State database: {snapshot.state_path or 'not found'}")
+    print(f"State schema version: {snapshot.schema_version if snapshot.schema_version is not None else 'unknown'}")
+    print(f"Session directory: {settings.codex_home / 'sessions'}")
+    print(f"Rollout files: {len(rollouts)}")
+    if rollouts:
+        print(f"Earliest/latest rollout: {rollouts[0].name} / {rollouts[-1].name}")
+    print(f"State DB root/child threads: {roots} / {len(snapshot.edges)}")
+    print(f"Models encountered: {', '.join(models) or 'none'}")
+    with database(settings.database) as conn:
+        missing = conn.execute(
+            "SELECT DISTINCT provider||':'||model FROM usage WHERE price_id IS NULL ORDER BY 1"
+        ).fetchall()
+        warnings = conn.execute("SELECT COUNT(*) FROM parser_warnings").fetchone()[0]
+        resolved = conn.execute(
+            "SELECT SUM(parent_thread_id IS NULL),SUM(parent_thread_id IS NOT NULL) FROM agents"
+        ).fetchone()
+        orphans = conn.execute("SELECT COUNT(*) FROM agents WHERE orphan=1").fetchone()[0]
+        incomplete = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE accounting_status!='complete'"
+        ).fetchone()[0]
+    print(f"Dashboard resolved root/child agents: {int(resolved[0] or 0)} / {int(resolved[1] or 0)}")
+    print(f"Orphan subagents: {orphans}")
+    print(f"Sessions with incomplete accounting: {incomplete}")
+    print(f"Models without prices: {', '.join(r[0] for r in missing) or 'none'}")
+    print(f"Parser warnings: {warnings}")
+    print(f"Dashboard database: {settings.database}")
+    if snapshot.warning:
+        print(f"State warning: {snapshot.warning}")
+    return 0
+
+
+def sessions_command(settings: Settings, limit: int, sort: str) -> int:
+    _prepare(settings)
+    with database(settings.database, readonly=True) as conn:
+        rows = session_rows(conn, order=sort, limit=limit)
+    print(f"{'Started':16}  {'Task':38}  {'Project':20}  {'Models':24} {'Agents':>6} {'Tokens':>10} {'Cost':>16}")
+    for row in rows:
+        title = (row["title"] or "(untitled)")[:38]
+        project = (row["repo_name"] or row["cwd"] or "unknown")[-20:]
+        models = (row["models_used"] or row["root_model"] or "unknown")[:24]
+        print(
+            f"{iso_date(row['created_at']):16}  {title:38}  {project:20}  {models:24} "
+            f"{row['agent_count']:6d} {format_tokens(row['total_tokens']):>10} "
+            f"{format_cost(row['known_cost_usd'],row['unknown_cost_records']):>16}"
+        )
+    return 0
+
+
+SESSION_EXPORT_FIELDS = (
+    "session_id", "date", "title", "project", "root_model", "models_used", "agent_count",
+    "input_tokens", "cached_input_tokens", "cache_write_input_tokens", "uncached_input_tokens",
+    "output_tokens", "reasoning_tokens", "total_tokens", "cost_usd", "known_cost_usd",
+    "unknown_cost_records", "duration_seconds", "tags",
+)
+
+
+def _export_rows(conn, breakdown: str) -> list[dict]:
+    def exact_cost(where: str, params: tuple) -> str | None:
+        values = conn.execute(f"SELECT cost_usd FROM usage WHERE {where} AND cost_usd IS NOT NULL", params)
+        total = Decimal("0")
+        seen = False
+        for value, in values:
+            total += Decimal(value)
+            seen = True
+        return format(total, "f") if seen else None
+
+    if breakdown == "models":
+        rows = conn.execute(
+            """SELECT u.session_id,u.model,u.provider,COUNT(DISTINCT u.thread_id) agent_count,
+               COUNT(*) usage_events,SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
+               SUM(cache_write_input_tokens) cache_write_input_tokens,SUM(uncached_input_tokens) uncached_input_tokens,
+               SUM(output_tokens) output_tokens,SUM(reasoning_output_tokens) reasoning_tokens,
+               SUM(total_tokens) total_tokens,SUM(CAST(cost_usd AS REAL)) known_cost_usd,
+               SUM(cost_usd IS NULL) unknown_cost_records FROM usage u GROUP BY u.session_id,u.model,u.provider
+               ORDER BY u.session_id,u.model"""
+        ).fetchall()
+        output = []
+        for row in rows:
+            data = dict(row)
+            data["known_cost_usd"] = exact_cost(
+                "session_id=? AND model=? AND provider=?",
+                (data["session_id"], data["model"], data["provider"]),
+            )
+            output.append(data)
+        return output
+    output = []
+    for row in session_rows(conn):
+        data = as_dict(row)
+        known_exact = exact_cost("session_id=?", (data["id"],))
+        output.append({
+            "session_id": data["id"], "date": data["created_at"], "title": data["title"],
+            "project": data["repo_name"] or data["cwd"], "root_model": data["root_model"],
+            "models_used": data["models_used"], "agent_count": data["agent_count"],
+            "input_tokens": data["input_tokens"], "cached_input_tokens": data["cached_input_tokens"],
+            "cache_write_input_tokens": data["cache_write_input_tokens"],
+            "uncached_input_tokens": data["uncached_input_tokens"], "output_tokens": data["output_tokens"],
+            "reasoning_tokens": data["reasoning_tokens"], "total_tokens": data["total_tokens"],
+            "cost_usd": None if data["unknown_cost_records"] else known_exact,
+            "known_cost_usd": known_exact,
+            "unknown_cost_records": data["unknown_cost_records"], "duration_seconds": data["duration_seconds"],
+            "tags": data["tags"],
+        })
+    return output
+
+
+def export_command(settings: Settings, fmt: str, breakdown: str, output_path: str) -> int:
+    _prepare(settings)
+    with database(settings.database, readonly=True) as conn:
+        rows = _export_rows(conn, breakdown)
+    handle = sys.stdout if output_path == "-" else open(output_path, "w", newline="", encoding="utf-8")
+    try:
+        if fmt == "json":
+            json.dump(rows, handle, indent=2)
+            handle.write("\n")
+        else:
+            fields = list(rows[0]) if rows else list(SESSION_EXPORT_FIELDS)
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+    finally:
+        if handle is not sys.stdout:
+            handle.close()
+    return 0
+
+
+def rebuild(settings: Settings, confirmed: bool) -> int:
+    if not confirmed:
+        answer = input(
+            f"Clear imported data and rebuild dashboard database {settings.database}? [y/N] "
+        ).strip().lower()
+        confirmed = answer in {"y", "yes"}
+    if not confirmed:
+        print("Cancelled.")
+        return 1
+    try:
+        settings.validate()
+    except ValueError as exc:
+        print(f"Refusing: {exc}", file=sys.stderr)
+        return 2
+    initialize(settings.database)
+    with database(settings.database) as conn:
+        saved_tags = conn.execute(
+            """SELECT st.session_id,t.name FROM session_tags st
+               JOIN tags t ON t.id=st.tag_id"""
+        ).fetchall()
+        conn.execute("DELETE FROM usage")
+        conn.execute("DELETE FROM agents")
+        conn.execute("DELETE FROM sessions")
+        conn.execute("DELETE FROM ingestion_state")
+        conn.execute("DELETE FROM parser_warnings")
+    _print_ingest(ingest(settings, force_all=True))
+    with database(settings.database) as conn:
+        for session_id, tag_name in saved_tags:
+            conn.execute(
+                """INSERT OR IGNORE INTO session_tags(session_id,tag_id)
+                   SELECT ?,id FROM tags WHERE name=? AND EXISTS(
+                     SELECT 1 FROM sessions WHERE id=?)""",
+                (session_id, tag_name, session_id),
+            )
+    return 0
+
+
+def tag_command(settings: Settings, session_id: str, names: list[str]) -> int:
+    _prepare(settings)
+    cleaned = sorted({name.strip() for name in names if name.strip()})
+    with database(settings.database) as conn:
+        if not conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+            print("Unknown session", file=sys.stderr)
+            return 2
+        conn.execute("DELETE FROM session_tags WHERE session_id=?", (session_id,))
+        for name in cleaned:
+            conn.execute("INSERT OR IGNORE INTO tags(name) VALUES(?)", (name,))
+            conn.execute(
+                "INSERT INTO session_tags(session_id,tag_id) SELECT ?,id FROM tags WHERE name=?",
+                (session_id, name),
+            )
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose > 1 else logging.INFO if args.verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+    try:
+        settings = _settings(args)
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+    if args.command == "doctor":
+        return doctor(settings)
+    if args.command == "ingest":
+        _print_ingest(ingest(settings, force_all=args.all))
+        return 0
+    if args.command == "sessions":
+        return sessions_command(settings, args.limit, args.sort)
+    if args.command == "prices":
+        _prepare(settings)
+        with database(settings.database, readonly=True) as conn:
+            rows = conn.execute("SELECT * FROM prices ORDER BY model,effective_from").fetchall()
+        for row in rows:
+            until = row["effective_until"] or "present"
+            print(
+                f"{row['model']:18} {row['provider']:8} {row['effective_from']}..{until} "
+                f"in={row['input_per_million']} cached={row['cached_input_per_million']} "
+                f"write={row['cache_write_per_million']} out={row['output_per_million']} USD/MTok"
+            )
+        return 0
+    if args.command == "price-add":
+        _prepare(settings)
+        with database(settings.database) as conn:
+            add_price(
+                conn, model=args.model, provider=args.provider, effective_from=args.effective_from,
+                effective_until=args.effective_until, input_per_million=args.input,
+                cached_input_per_million=args.cached_input, cache_write_per_million=args.cache_write,
+                output_per_million=args.output_price, source=args.source, notes=args.notes,
+            )
+            updated = reprice_usage(conn, provider=args.provider)
+        print(f"Repriced usage records: {updated}")
+        return 0
+    if args.command == "watch":
+        try:
+            while True:
+                _print_ingest(ingest(settings))
+                time.sleep(max(1, args.interval))
+        except KeyboardInterrupt:
+            return 0
+    if args.command == "serve":
+        import uvicorn
+        from .web.app import create_app
+        uvicorn.run(create_app(settings, ingest_interval=args.interval), host=args.host, port=args.port)
+        return 0
+    if args.command == "export":
+        return export_command(settings, args.format, args.breakdown, args.output)
+    if args.command == "rebuild":
+        return rebuild(settings, args.yes)
+    if args.command == "tag":
+        return tag_command(settings, args.session_id, args.tags)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

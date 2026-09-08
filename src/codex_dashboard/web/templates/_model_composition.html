@@ -1,0 +1,13 @@
+<div class="composition-grid" aria-label="Model composition charts">
+  {% for metric,label,total in [('cost','Known cost',model_composition.cost),('tokens','Tokens',model_composition.tokens),('calls','Calls',model_composition.calls)] %}
+  <section class="composition-card">
+    <div class="composition-heading"><h3>{{ label }}</h3><strong>{% if metric=='cost' %}{{ total|cost }}{% elif metric=='tokens' %}{{ total|tokens }}{% else %}{{ total|int }}{% endif %}</strong></div>
+    <div class="stacked-bar" role="img" aria-label="{{ label }} by model">
+      {% for entry in model_composition.entries %}{% if entry[metric] %}<span class="segment model-{{ entry.style }}" style="flex-grow:{{ entry[metric] }}" title="{{ entry.model }}: {% if metric=='cost' %}{{ entry[metric]|cost(entry.unknown_cost_records) }}{% elif metric=='tokens' %}{{ entry[metric]|tokens }}{% else %}{{ entry[metric] }} calls{% endif %}"></span>{% endif %}{% endfor %}
+    </div>
+    <div class="composition-legend">
+      {% for entry in model_composition.entries %}{% if entry[metric] %}<div><span class="swatch model-{{ entry.style }}"></span><span class="legend-model">{{ entry.model }}</span><strong>{% if total %}{{ '%.1f'|format(100*entry[metric]/total) }}%{% else %}—{% endif %}</strong></div>{% endif %}{% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+</div>
