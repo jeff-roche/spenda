@@ -55,12 +55,7 @@ The dashboard database defaults to:
 
 Set `CODEX_DASHBOARD_DB` or pass `--database` to change it. Validation prevents the dashboard database from being placed inside Codex or Claude source storage or from replacing the OpenCode database.
 
-Detailed source mappings are documented in:
-
-- [Codex data sources](docs/codex-data-sources.md)
-- [OpenCode data sources](docs/opencode-data-sources.md)
-- [Claude Code data sources](docs/claude-data-sources.md)
-- [Accounting rules](docs/accounting.md)
+Accounting rules are documented in [docs/accounting.md](docs/accounting.md).
 
 ## Commands
 

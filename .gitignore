@@ -9,3 +9,6 @@ __pycache__/
 htmlcov/
 .playwright-cli/
 output/
+docs/claude-data-sources.md
+docs/codex-data-sources.md
+docs/opencode-data-sources.md
