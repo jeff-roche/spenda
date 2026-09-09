@@ -110,7 +110,7 @@ Local totals should be reconciled with OpenAI organization Usage/Costs APIs or i
 
 ## 10. OpenCode accounting
 
-OpenCode assistant messages already contain token categories and a client-calculated cost. The dashboard imports that cost directly and does not apply its Codex price table. Cache reads and writes are added to OpenCode's uncached input, and reasoning is added to visible output, so the normalized token identities match Codex reports. See `opencode-data-sources.md` for the exact mapping and read-only boundary.
+OpenCode assistant messages already contain token categories and a client-calculated cost. The dashboard imports that cost directly and does not apply its Codex price table. Cache reads and writes are added to OpenCode's uncached input, and reasoning is added to visible output, so the normalized token identities match Codex reports. See [data-sources.md](data-sources.md) for the exact mapping and read-only boundary.
 
 ## 11. Claude Code accounting
 

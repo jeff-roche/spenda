@@ -23,6 +23,11 @@ Tests use synthetic temporary source data. They must not depend on a contributor
 - `tests/` contains synthetic unit and integration fixtures.
 - `docs/` records source schemas and accounting decisions.
 
+## Documentation
+
+- [Data sources](docs/data-sources.md) describes discovery, source fields, and normalization for each supported tool.
+- [Accounting rules](docs/accounting.md) explains cost and token calculations.
+
 ## Make a change
 
 1. Create a focused branch.
@@ -49,7 +54,7 @@ New and changed adapters must satisfy these rules:
 - Preserve existing data when a source is temporarily missing, unreadable, locked, or partially written.
 - Build fixtures from synthetic data and include malformed, duplicate, deletion, and partial-scan cases where applicable.
 
-If a source schema changes, record the observed version and fields in its document under `docs/`.
+If a source schema changes, update the observed version and fields in [Data sources](docs/data-sources.md).
 
 ## Validation
 
