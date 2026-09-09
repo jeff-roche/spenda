@@ -1,6 +1,6 @@
 # Contributing
 
-Contributions to the Coding Agent Usage Dashboard are welcome. Changes should preserve accurate accounting, source isolation, and the privacy boundary described below.
+Contributions to Spenda are welcome. Changes should preserve accurate accounting, source isolation, and the privacy boundary described below.
 
 ## Development setup
 
@@ -8,18 +8,18 @@ Install Python 3.11 or newer and [uv](https://docs.astral.sh/uv/), then create t
 
 ```bash
 uv sync
-uv run codex-dashboard --help
+uv run spenda --help
 ```
 
 Tests use synthetic temporary source data. They must not depend on a contributor's real Codex, OpenCode, or Claude history.
 
 ## Repository layout
 
-- `src/codex_dashboard/ingestion/` contains source discovery, parsing, normalization, and reconciliation.
-- `src/codex_dashboard/web/` contains FastAPI routes, templates, and static presentation.
-- `src/codex_dashboard/config.py` resolves source and dashboard paths.
-- `src/codex_dashboard/db.py` owns the normalized schema and migrations.
-- `src/codex_dashboard/pricing.py` contains effective-dated price calculations.
+- `src/spenda/ingestion/` contains source discovery, parsing, normalization, and reconciliation.
+- `src/spenda/web/` contains FastAPI routes, templates, and static presentation.
+- `src/spenda/config.py` resolves source and dashboard paths.
+- `src/spenda/db.py` owns the normalized schema and migrations.
+- `src/spenda/pricing.py` contains effective-dated price calculations.
 - `tests/` contains synthetic unit and integration fixtures.
 - `docs/` records source schemas and accounting decisions.
 

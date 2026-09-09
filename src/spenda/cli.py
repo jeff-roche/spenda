@@ -22,7 +22,7 @@ from .ingestion.service import ingest_all as ingest
 from .pricing import add_price, reprice_usage, seed_prices
 from .reports import as_dict, format_cost, format_tokens, iso_date, session_rows
 
-log = logging.getLogger("codex_dashboard")
+log = logging.getLogger("spenda")
 
 
 def _add_config(parser: argparse.ArgumentParser) -> None:
@@ -34,7 +34,7 @@ def _add_config(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="codex-dashboard")
+    parser = argparse.ArgumentParser(prog="spenda")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-v", "--verbose", action="count", default=0)
     sub = parser.add_subparsers(dest="command", required=True)

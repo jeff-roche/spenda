@@ -62,8 +62,8 @@ class Settings:
         data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
         db = Path(
             database
-            or os.environ.get("CODEX_DASHBOARD_DB")
-            or data_home / "codex-usage-dashboard" / "dashboard.sqlite"
+            or os.environ.get("SPENDA_DB")
+            or data_home / "spenda" / "dashboard.sqlite"
         ).expanduser()
         opencode_db = Path(opencode_database).expanduser() if opencode_database else _default_opencode_database()
         claude = Path(claude_home).expanduser() if claude_home else _default_claude_home()

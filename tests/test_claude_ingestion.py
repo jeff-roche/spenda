@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from codex_dashboard.db import database
-from codex_dashboard.ingestion.claude import discover_claude_home, ingest_claude
-import codex_dashboard.ingestion.claude as claude_module
-from codex_dashboard.pricing import reprice_usage
-from codex_dashboard.reports import session_detail
+from spenda.db import database
+from spenda.ingestion.claude import discover_claude_home, ingest_claude
+import spenda.ingestion.claude as claude_module
+from spenda.pricing import reprice_usage
+from spenda.reports import session_detail
 
 
 @dataclass

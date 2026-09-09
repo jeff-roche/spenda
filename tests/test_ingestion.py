@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from codex_dashboard.db import database
-from codex_dashboard.config import Settings
-from codex_dashboard.ingestion.scanner import ingest
+from spenda.db import database
+from spenda.config import Settings
+from spenda.ingestion.scanner import ingest
 from conftest import atomic, make_state, session_meta, thread, token_count, turn, usage_values, write_rollout
 
 

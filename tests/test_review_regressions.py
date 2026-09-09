@@ -8,14 +8,14 @@ from datetime import datetime, timezone
 import pytest
 from starlette.requests import Request
 
-from codex_dashboard.cli import rebuild, tag_command
-from codex_dashboard.config import Settings
-from codex_dashboard.db import database, initialize
-from codex_dashboard.ingestion.scanner import ingest
-from codex_dashboard.pricing import add_price, reprice_usage
-from codex_dashboard.reports import session_rows
-from codex_dashboard.web.app import SESSION_SORT_KEYS, _model_style, _period_boundary, create_app
-import codex_dashboard.web.app as web_module
+from spenda.cli import rebuild, tag_command
+from spenda.config import Settings
+from spenda.db import database, initialize
+from spenda.ingestion.scanner import ingest
+from spenda.pricing import add_price, reprice_usage
+from spenda.reports import session_rows
+from spenda.web.app import SESSION_SORT_KEYS, _model_style, _period_boundary, create_app
+import spenda.web.app as web_module
 from conftest import atomic, make_state, session_meta, thread, turn, usage_values, write_rollout
 
 

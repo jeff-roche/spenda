@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_dashboard.config import Settings
+from spenda.config import Settings
 
 
 @pytest.fixture

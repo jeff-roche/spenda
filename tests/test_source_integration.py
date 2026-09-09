@@ -5,11 +5,11 @@ import sqlite3
 
 from starlette.requests import Request
 
-from codex_dashboard.cli import export_command
-from codex_dashboard.config import Settings
-from codex_dashboard.db import database
-from codex_dashboard.ingestion.service import ingest_all
-from codex_dashboard.web.app import create_app
+from spenda.cli import export_command
+from spenda.config import Settings
+from spenda.db import database
+from spenda.ingestion.service import ingest_all
+from spenda.web.app import create_app
 from conftest import atomic, make_state, session_meta, thread, turn, write_rollout
 from test_opencode_ingestion import _source_db
 from test_claude_ingestion import _fixture

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from codex_dashboard.ingestion.rollout import ParserContext, RolloutParser
+from spenda.ingestion.rollout import ParserContext, RolloutParser
 from conftest import atomic, session_meta, token_count, turn, usage_values
 
 

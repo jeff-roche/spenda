@@ -4,10 +4,10 @@ import json
 import sqlite3
 from pathlib import Path
 
-from codex_dashboard.config import Settings
-from codex_dashboard.db import database
-from codex_dashboard.ingestion.opencode import ingest_opencode
-from codex_dashboard.pricing import add_price, reprice_usage
+from spenda.config import Settings
+from spenda.db import database
+from spenda.ingestion.opencode import ingest_opencode
+from spenda.pricing import add_price, reprice_usage
 
 
 def _source_db(path: Path) -> None:

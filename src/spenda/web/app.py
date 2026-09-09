@@ -254,7 +254,7 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                 refresh()
                 stop.wait(max(1, ingest_interval))
 
-        task = threading.Thread(target=loop, name="codex-dashboard-ingest", daemon=True)
+        task = threading.Thread(target=loop, name="spenda-ingest", daemon=True)
         task.start()
         yield
         stop.set()
@@ -262,7 +262,7 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         if task.is_alive():
             log.warning("Background ingestion did not stop within five seconds")
 
-    app = FastAPI(title="Coding Agent Usage Dashboard", lifespan=lifespan)
+    app = FastAPI(title="Spenda", lifespan=lifespan)
     app.state.settings = settings
     templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
     templates.env.filters.update(

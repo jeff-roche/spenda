@@ -4,8 +4,8 @@ import sqlite3
 
 import pytest
 
-from codex_dashboard.config import Settings
-from codex_dashboard.db import SCHEMA, SCHEMA_VERSION, initialize
+from spenda.config import Settings
+from spenda.db import SCHEMA, SCHEMA_VERSION, initialize
 
 
 def test_v3_sessions_migrate_to_generic_source_columns(tmp_path):

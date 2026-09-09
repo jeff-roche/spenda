@@ -1,4 +1,4 @@
-# Coding Agent Usage Dashboard
+# Spenda
 
 A local dashboard for token usage, costs, models, projects, and session activity from Codex, OpenCode, and Claude Code.
 
@@ -22,8 +22,8 @@ Requires Python 3.11 or newer and at least one supported coding agent with local
 
 ```bash
 uv sync
-uv run codex-dashboard ingest --all
-uv run codex-dashboard serve
+uv run spenda ingest --all
+uv run spenda serve
 ```
 
 ### With pip
@@ -33,24 +33,24 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -m pip install .
-codex-dashboard ingest --all
-codex-dashboard serve
+spenda ingest --all
+spenda serve
 ```
 
 Open <http://127.0.0.1:8765>.
 
 ## Use
 
-Start the dashboard with `codex-dashboard serve`. If you installed with uv, use `uv run codex-dashboard serve`. It checks configured sources for updates while it runs. Use `codex-dashboard doctor` to see which sources it found and why a source may show no data.
+Start the dashboard with `spenda serve`. If you installed with uv, use `uv run spenda serve`. It checks configured sources for updates while it runs. Use `spenda doctor` to see which sources it found and why a source may show no data.
 
 Choose **All sources**, **Codex**, **OpenCode**, or **Claude Code** from the dashboard filter. The Sessions view lets you inspect individual sessions; Models and Projects show aggregate usage. Use the theme switcher to choose light or dark mode.
 
 To use a non-default history location, set the matching environment variable before running a command:
 
 ```bash
-CODEX_HOME=~/.codex_private uv run codex-dashboard serve
-OPENCODE_DB=/path/to/opencode.db uv run codex-dashboard serve
-CLAUDE_CONFIG_DIR=/path/to/claude uv run codex-dashboard serve
+CODEX_HOME=~/.codex_private uv run spenda serve
+OPENCODE_DB=/path/to/opencode.db uv run spenda serve
+CLAUDE_CONFIG_DIR=/path/to/claude uv run spenda serve
 ```
 
 If you installed with pip, omit `uv run` from these commands.

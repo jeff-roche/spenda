@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from codex_dashboard.db import database, initialize
-from codex_dashboard.models import TokenUsage
-from codex_dashboard.pricing import add_price, calculate_cost, seed_prices
+from spenda.db import database, initialize
+from spenda.models import TokenUsage
+from spenda.pricing import add_price, calculate_cost, seed_prices
 
 
 def priced_conn(tmp_path):
