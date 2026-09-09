@@ -1,84 +1,164 @@
-# Codex Usage Dashboard
+# Coding Agent Usage Dashboard
 
-A local, server-rendered accounting dashboard for ordinary OpenAI API-key Codex CLI sessions. It reads the state Codex already persists; it does not enable debug tracing, proxy API calls, patch Codex, or change how `codex` is invoked.
+A local dashboard for token usage, cost, models, projects, and agent activity across Codex, OpenCode, and Claude Code.
 
-## Quick start
+The dashboard reads the history these tools already keep on disk. It does not proxy model traffic, enable tracing, or change how any coding agent runs. Source data is opened read-only; normalized accounting is stored in a separate SQLite database.
+
+## Features
+
+- One overview for Codex, OpenCode, and Claude Code, with a source selector for isolated reports.
+- Session, model, project, trend, and comparison views.
+- Root and subagent grouping where the source records reliable relationships.
+- Input, cached input, cache-write, output, reasoning, and total-token accounting.
+- Source-reported OpenCode and Claude costs where available, plus effective-dated pricing for Codex.
+- CSV and JSON exports with per-source filtering.
+- Persistent light and dark themes.
+- Deduplicated ingestion, safe incremental cursors where supported, and source-scoped deletion reconciliation.
+- A privacy boundary that excludes assistant responses, tool output, source code, and full conversations from the dashboard database.
+
+## Requirements
+
+- Python 3.11 or newer
+- [uv](https://docs.astral.sh/uv/)
+- At least one supported coding agent with local history
+
+The web interface binds to `127.0.0.1` by default and requires no external service.
+
+## Get started
+
+From this repository:
 
 ```bash
-git clone ...
-cd codex-usage-dashboard
 uv sync
-
 uv run codex-dashboard doctor
 uv run codex-dashboard ingest --all
 uv run codex-dashboard serve
 ```
 
-Open <http://127.0.0.1:8765>. The server binds only to loopback by default and refreshes ingestion every 10 seconds.
+Open <http://127.0.0.1:8765>. While the server is running, it checks the configured sources for updates every 10 seconds.
 
-Overview, session, and model pages include model-colored composition charts for known cost, tokens, and model calls. Session audit rows combine their sequential marker with a safe action category when ordinary rollout metadata provides one, for example `Call #014 · Run tests`; ambiguous calls retain only the marker. Expanding it reveals the full persisted response identity.
+## Data sources
 
-The overview's Recent tasks table and the full Tasks / sessions table sort by every displayed data column. Sorting is performed against raw numeric/date values, so abbreviated tokens, percentages, costs, agent counts, and durations retain correct numeric order.
+| Source | Default location | Override | Accounting behavior |
+|---|---|---|---|
+| Codex | `${CODEX_HOME:-~/.codex}` | `CODEX_HOME` or `--codex-home` | Reads state SQLite and rollout JSONL files; applies effective-dated prices when a model/provider price is known. |
+| OpenCode | `${OPENCODE_DB:-${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db}` | `OPENCODE_DB` or `--opencode-db` | Reads OpenCode's SQLite database and preserves its client-reported costs. |
+| Claude Code | `${CLAUDE_CONFIG_DIR:-~/.claude}` | `CLAUDE_CONFIG_DIR` or `--claude-home` | Reads project transcript JSONL files and uses cumulative `cost-state` values when available. |
 
-Point an instance at another Codex setup with either `CODEX_HOME=/path` or `--codex-home /path`. `--codex-home` takes precedence. The default dashboard database is:
+Missing sources are skipped. Command-line options take precedence over environment variables.
+
+The dashboard database defaults to:
 
 ```text
 ~/.local/share/codex-usage-dashboard/dashboard.sqlite
 ```
 
-Override it with `CODEX_DASHBOARD_DB` or `--database`. Codex-owned SQLite and JSONL data are always opened read-only. Only the separate dashboard database is modified.
+Set `CODEX_DASHBOARD_DB` or pass `--database` to change it. Validation prevents the dashboard database from being placed inside Codex or Claude source storage or from replacing the OpenCode database.
+
+Detailed source mappings are documented in:
+
+- [Codex data sources](docs/codex-data-sources.md)
+- [OpenCode data sources](docs/opencode-data-sources.md)
+- [Claude Code data sources](docs/claude-data-sources.md)
+- [Accounting rules](docs/accounting.md)
 
 ## Commands
 
+Inspect configured sources and accounting coverage:
+
 ```bash
 uv run codex-dashboard doctor
-uv run codex-dashboard ingest
-uv run codex-dashboard ingest --all
-uv run codex-dashboard sessions --sort cost
-uv run codex-dashboard prices
-uv run codex-dashboard watch --interval 10
-uv run codex-dashboard serve --port 8765
-uv run codex-dashboard export --format csv
-uv run codex-dashboard export --format csv --breakdown models
-uv run codex-dashboard export --format json -o sessions.json
-uv run codex-dashboard tag SESSION_ID baseline routed-v1
 ```
 
-Add a historical price without changing application code:
+Ingest once or watch continuously:
+
+```bash
+uv run codex-dashboard ingest
+uv run codex-dashboard ingest --all
+uv run codex-dashboard watch --interval 10
+```
+
+List sessions and filter by source:
+
+```bash
+uv run codex-dashboard sessions --sort cost
+uv run codex-dashboard sessions --source codex
+uv run codex-dashboard sessions --source opencode
+uv run codex-dashboard sessions --source claude
+```
+
+Serve on a different loopback port:
+
+```bash
+uv run codex-dashboard serve --port 9000
+```
+
+Export normalized accounting:
+
+```bash
+uv run codex-dashboard export --format csv --output sessions.csv
+uv run codex-dashboard export --format json --source claude --output claude.json
+uv run codex-dashboard export --format csv --breakdown models --output models.csv
+```
+
+Add a historical model price in USD per million tokens:
 
 ```bash
 uv run codex-dashboard price-add MODEL 2026-09-08T00:00:00Z \
-  --input 4 --cached-input 0.4 --cache-write 5 --output-price 20 \
-  --source https://developers.openai.com/api/docs/models/MODEL
+  --provider openai \
+  --input 4 \
+  --cached-input 0.4 \
+  --cache-write 5 \
+  --output-price 20 \
+  --source https://example.com/model-pricing
 ```
 
-Each amount is USD per million tokens. Add a new effective-dated row when a price changes; do not edit the older row. Existing usage for that provider is repriced immediately.
+Price rows are effective-dated. Add a new row when a price changes so historical calculations remain auditable.
 
-## Data and accounting
+## Privacy and safety
 
-The observed Codex data sources, schemas, and version-specific details are in [docs/codex-data-sources.md](docs/codex-data-sources.md). Exact counting, cached-token, reasoning-token, model-attribution, and pricing rules are in [docs/accounting.md](docs/accounting.md).
+The dashboard stores short task-identification metadata, source paths and identities, agent metadata, token counters, and costs. It does not persist assistant responses, thinking text, tool arguments or output, shell output, attachments, source code, credentials, or full conversations.
 
-At a high level, recent Codex versions persist one atomic usage record per API response. Older versions persist a per-response `last_token_usage` beside a cumulative snapshot. The dashboard counts the atomic form where present and never sums cumulative totals. Root/subagent grouping uses explicit spawn edges and structured parent metadata.
+Codex first-message previews are enabled by default and truncated to 240 characters. Pass `--no-preview` if you do not want them stored. OpenCode and Claude ingestion do not persist message previews.
 
-The dashboard stores only short task-identification metadata, agent metadata, token counters, prices, and source identities. It does not store assistant responses, tool output, shell output, source code, or full conversations. Use `--no-preview` to disable first-message previews; task titles remain truncated to one line.
+Ingestion writes only to the dashboard database. A missing or unreadable source scan does not erase previously normalized Claude data, and reconciliation is scoped to the source being scanned.
 
-## Rebuild safely
+## Cost interpretation
+
+Displayed totals include known amounts and silently omit unknown amounts. They should not be treated as invoices.
+
+- Codex costs are calculated from the effective-dated price table. Unknown models or providers remain unpriced.
+- OpenCode costs are imported from OpenCode. Free or subscription-backed providers may report zero despite consuming quota.
+- Claude costs use persisted `cost-state` snapshots. Older sessions remain unpriced, and root snapshots do not prove coverage of child-agent usage.
+
+Tool fees, service-tier adjustments, regional uplifts, credits, taxes, and other server-side billing changes may be absent from local records.
+
+## Rebuild normalized data
 
 ```bash
 uv run codex-dashboard rebuild
-# non-interactive:
+# Non-interactive:
 uv run codex-dashboard rebuild --yes
 ```
 
-This clears and reimports only normalized Codex-derived data. Historical prices, aliases, tags, and tag assignments for sessions that still exist are preserved. It refuses to operate if the configured dashboard database is under `CODEX_HOME` and never removes or changes Codex history.
+Rebuild clears and reimports normalized sessions, agents, usage, and parser state. It preserves price definitions, aliases, tags, and tag assignments for sessions that still exist. It never removes or changes coding-agent history.
 
-## Known limits
+## Troubleshooting
 
-- Costs are local estimates from persisted token records and an effective-dated price table, not OpenAI invoice data.
-- Tool-call fees, service-tier adjustments, regional-processing uplifts, and server-side credits are not presently persisted by normal Codex rollouts and are not estimated.
-- Any future/legacy subagent that lacks both a parent ID and a root `session_id` is marked as an orphan rather than associated by timing.
-- Provider-specific deployments such as Azure remain unpriced unless their own historical price rows are added.
-- Unknown models and prices remain visible as `unknown`; they are never silently mapped.
-- The first built-in price capture has a documented coverage-floor assumption for pre-capture local history. See the accounting document before treating historical totals as invoice-exact.
+Run `uv run codex-dashboard doctor` first. It prints the resolved source paths, detected session counts, incomplete accounting, models without costs, parser warnings, and dashboard database location.
 
-ChatGPT Plus quota tracking is intentionally out of scope.
+If a source tab shows zero, select **All time** to rule out the active date filter. Restart the dashboard process after updating the application so new source adapters and interface changes are loaded.
+
+If you run Codex with another home, launch the dashboard with the same value:
+
+```bash
+CODEX_HOME=~/.codex_private uv run codex-dashboard serve
+```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, source-adapter safety rules, and required checks.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

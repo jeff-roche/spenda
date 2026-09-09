@@ -166,7 +166,21 @@ def test_session_page_has_model_charts_and_readable_call_labels(dashboard_settin
     assert "Known cost" in body and "Tokens" in body and "Calls" in body
     assert "Call #001" in body and "root-response" in body
     assert _model_style("gpt-5.6-sol") == "sol"
-    assert _model_style("future-model") == "other"
+    assert _model_style("future-model") == _model_style("future-model")
+
+
+def test_claude_models_have_distinct_styles():
+    models = (
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-haiku-4-5@20251001",
+        "claude-opus-4-6",
+        "claude-sonnet-5",
+        "claude-sonnet-4-5-20250929",
+    )
+
+    assert len({_model_style(model) for model in models}) == len(models)
+    assert _model_style("claude-opus-4-8@default") == _model_style("claude-opus-4-8")
 
 
 def test_session_page_shows_safe_call_action_when_available(dashboard_settings):

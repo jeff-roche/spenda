@@ -13,7 +13,11 @@ from codex_dashboard.config import Settings
 def dashboard_settings(tmp_path: Path) -> Settings:
     home = tmp_path / "codex"
     (home / "sessions" / "2026" / "09" / "08").mkdir(parents=True)
-    return Settings(home, tmp_path / "dashboard.sqlite", True, running_window_seconds=0)
+    return Settings(
+        home, tmp_path / "dashboard.sqlite", True, running_window_seconds=0,
+        opencode_database=tmp_path / "missing-opencode.sqlite",
+        claude_home=tmp_path / "missing-claude",
+    )
 
 
 def make_state(home: Path, threads: list[dict], edges: list[tuple[str, str]] = ()) -> Path:
@@ -112,4 +116,3 @@ def token_count(values: dict, *, ordinal: int = 3, total: dict | None = None) ->
 def write_rollout(path: Path, records: list[dict], *, final_newline: bool = True) -> None:
     text = "\n".join(json.dumps(record, separators=(",", ":")) for record in records)
     path.write_text(text + ("\n" if final_newline else ""), encoding="utf-8")
-

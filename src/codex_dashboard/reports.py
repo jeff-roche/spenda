@@ -16,7 +16,7 @@ WITH agent_agg AS (
          SUM(reasoning_output_tokens) reasoning_tokens,SUM(total_tokens) total_tokens,
          SUM(CAST(cost_usd AS REAL)) known_cost_usd,
          SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) unknown_cost_records,
-         COUNT(*) usage_events
+         SUM(source_event_type!='claude_cost_state') usage_events
   FROM usage GROUP BY session_id
 ), tag_agg AS (
   SELECT st.session_id,GROUP_CONCAT(t.name) tags
@@ -56,6 +56,7 @@ def session_rows(
     allowed_orders = {
         "time": "julianday(s.created_at)",
         "started": "julianday(s.created_at)",
+        "source": "LOWER(s.source_app)",
         "title": "LOWER(COALESCE(s.title,''))",
         "project": "LOWER(COALESCE(s.repo_name,s.cwd,''))",
         "root_model": "LOWER(COALESCE(s.root_model,''))",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import statistics
 import threading
@@ -15,7 +16,7 @@ from fastapi.templating import Jinja2Templates
 
 from ..config import Settings
 from ..db import database, initialize
-from ..ingestion.scanner import ingest
+from ..ingestion.service import ingest_all as ingest
 from ..pricing import seed_prices
 from ..reports import format_cost, format_duration, format_tokens, iso_date, session_detail, session_rows
 
@@ -26,22 +27,56 @@ MODEL_STYLES = {
     "gpt-5.6-terra": "terra",
     "gpt-5.6-luna": "luna",
     "gpt-6-astra": "astra",
+    "claude-opus-4-8": "blue",
+    "claude-opus-5": "coral",
+    "claude-haiku-4-5-20251001": "green",
+    "claude-haiku-4-5@20251001": "green",
+    "claude-opus-4-6": "purple",
+    "claude-sonnet-5": "orange",
+    "claude-sonnet-4-5-20250929": "teal",
 }
+MODEL_PALETTE = (
+    "blue", "coral", "green", "purple", "orange",
+    "teal", "pink", "olive", "indigo", "rust",
+)
+SOURCES = ("all", "codex", "opencode", "claude")
+SOURCE_LABELS = {"all": "All", "codex": "Codex", "opencode": "OpenCode", "claude": "Claude Code"}
 SESSION_SORT_KEYS = (
-    "started", "title", "project", "root_model", "models", "agents", "input",
+    "started", "source", "title", "project", "root_model", "models", "agents", "input",
     "cached", "output", "total", "cost", "duration",
 )
 SESSION_SORT_LABELS = {
-    "started": "Started", "title": "Task / title", "project": "Project",
+    "started": "Started", "source": "Source", "title": "Task / title", "project": "Project",
     "root_model": "Root model", "models": "Models used", "agents": "Agents",
     "input": "Input", "cached": "Cached", "output": "Output", "total": "Total",
     "cost": "Cost", "duration": "Duration",
 }
-TEXT_SESSION_SORTS = {"title", "project", "root_model", "models"}
+TEXT_SESSION_SORTS = {"source", "title", "project", "root_model", "models"}
 
 
 def _model_style(model: str) -> str:
-    return MODEL_STYLES.get(model, "other")
+    normalized = model.removesuffix("@default")
+    if style := MODEL_STYLES.get(normalized):
+        return style
+
+    # Keep unfamiliar model colors stable across page loads and server restarts.
+    digest = hashlib.blake2s(normalized.encode("utf-8"), digest_size=2).digest()
+    index = int.from_bytes(digest, byteorder="big") % len(MODEL_PALETTE)
+    return MODEL_PALETTE[index]
+
+
+def _source(value: str) -> str:
+    return value if value in SOURCES else "all"
+
+
+def _source_usage_clause(source: str, alias: str = "u") -> tuple[str, tuple[Any, ...]]:
+    if source == "all":
+        return "1=1", ()
+    return (
+        f"EXISTS(SELECT 1 FROM sessions source_session WHERE source_session.id={alias}.session_id "
+        "AND source_session.source_app=?)",
+        (source,),
+    )
 
 
 def _model_composition(rows: list[Any]) -> dict[str, Any]:
@@ -98,23 +133,36 @@ def _period_boundary(period: str, now: datetime | None = None) -> str | None:
     return start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _period_clause(period: str) -> tuple[str, tuple[Any, ...]]:
+def _period_clause(period: str, source: str = "all") -> tuple[str, tuple[Any, ...]]:
     boundary = _period_boundary(period)
-    return ("1=1", ()) if boundary is None else ("julianday(u.timestamp)>=julianday(?)", (boundary,))
+    clauses, params = [], []
+    if boundary is not None:
+        clauses.append("julianday(u.timestamp)>=julianday(?)")
+        params.append(boundary)
+    source_clause, source_params = _source_usage_clause(source)
+    clauses.append(source_clause)
+    params.extend(source_params)
+    return " AND ".join(clauses), tuple(params)
 
 
-def _session_period(period: str) -> tuple[str, tuple[Any, ...]]:
+def _session_period(period: str, source: str = "all") -> tuple[str, tuple[Any, ...]]:
     boundary = _period_boundary(period)
-    if boundary is None:
-        return "EXISTS(SELECT 1 FROM usage up WHERE up.session_id=s.id)", ()
-    return (
-        "EXISTS(SELECT 1 FROM usage up WHERE up.session_id=s.id AND julianday(up.timestamp)>=julianday(?))",
-        (boundary,),
-    )
+    usage = "EXISTS(SELECT 1 FROM usage up WHERE up.session_id=s.id"
+    params: list[Any] = []
+    if boundary is not None:
+        usage += " AND julianday(up.timestamp)>=julianday(?)"
+        params.append(boundary)
+    usage += ")"
+    if source != "all":
+        usage += " AND s.source_app=?"
+        params.append(source)
+    return usage, tuple(params)
 
 
-def _overview(conn, period: str, sort: str = "started", direction: str = "desc") -> dict[str, Any]:
-    usage_where, usage_params = _period_clause(period)
+def _overview(
+    conn, period: str, sort: str = "started", direction: str = "desc", source: str = "all"
+) -> dict[str, Any]:
+    usage_where, usage_params = _period_clause(period, source)
     usage = conn.execute(
         f"""SELECT COALESCE(SUM(total_tokens),0) tokens,COALESCE(SUM(input_tokens),0) input_tokens,
             COALESCE(SUM(cached_input_tokens),0) cached_tokens,SUM(CAST(cost_usd AS REAL)) known_cost,
@@ -122,7 +170,7 @@ def _overview(conn, period: str, sort: str = "started", direction: str = "desc")
             COUNT(DISTINCT thread_id) agents FROM usage u WHERE {usage_where}""",
         usage_params,
     ).fetchone()
-    session_where, session_params = _session_period(period)
+    session_where, session_params = _session_period(period, source)
     rows = session_rows(
         conn, where=session_where, params=session_params, order=sort, direction=direction
     )
@@ -138,7 +186,8 @@ def _overview(conn, period: str, sort: str = "started", direction: str = "desc")
     models = conn.execute(
         f"""SELECT model,COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
             SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
-            SUM(output_tokens) output_tokens,SUM(total_tokens) total_tokens,COUNT(*) usage_events,
+            SUM(output_tokens) output_tokens,SUM(total_tokens) total_tokens,
+            SUM(source_event_type!='claude_cost_state') usage_events,
             SUM(CAST(cost_usd AS REAL)) cost_usd,SUM(cost_usd IS NULL) unknown_cost_records
             FROM usage u WHERE {usage_where} GROUP BY model ORDER BY cost_usd DESC""",
         usage_params,
@@ -213,7 +262,7 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         if task.is_alive():
             log.warning("Background ingestion did not stop within five seconds")
 
-    app = FastAPI(title="Codex Usage Dashboard", lifespan=lifespan)
+    app = FastAPI(title="Coding Agent Usage Dashboard", lifespan=lifespan)
     app.state.settings = settings
     templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
     templates.env.filters.update(
@@ -222,24 +271,37 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
     )
 
     def render(request: Request, name: str, **context):
-        return templates.TemplateResponse(request=request, name=name, context={"request": request, **context})
+        source = _source(context.pop("source", "all"))
+        source_links = {
+            item: str(request.url.include_query_params(source=item)) for item in SOURCES
+        }
+        return templates.TemplateResponse(
+            request=request,
+            name=name,
+            context={
+                "request": request, "source": source, "sources": SOURCES,
+                "source_links": source_links, "source_labels": SOURCE_LABELS, **context,
+            },
+        )
 
     @app.get("/", response_class=HTMLResponse)
     def home(
-        request: Request, period: str = "30d", sort: str = "started", direction: str = "desc"
+        request: Request, period: str = "30d", sort: str = "started", direction: str = "desc",
+        source: str = "all",
     ):
+        source = _source(source)
         sort = sort if sort in SESSION_SORT_KEYS else "started"
         direction = "asc" if direction == "asc" else "desc"
         with database(settings.database, readonly=True) as conn:
-            overview = _overview(conn, period, sort, direction)
-            usage_where, usage_params = _period_clause(period)
+            overview = _overview(conn, period, sort, direction, source)
+            usage_where, usage_params = _period_clause(period, source)
             daily = conn.execute(
                 f"SELECT date(timestamp,'localtime'),SUM(CAST(cost_usd AS REAL)) FROM usage u WHERE {usage_where} "
                 "GROUP BY date(timestamp,'localtime') ORDER BY date(timestamp,'localtime')",
                 usage_params,
             ).fetchall()
         return render(
-            request, "home.html", active="home", period=period, data=overview,
+            request, "home.html", active="home", source=source, period=period, data=overview,
             trend=_svg_trend(daily), refresh=10, sort_key=sort, sort_direction=direction,
             sort_links=_sort_links(request, sort, direction),
         )
@@ -250,10 +312,13 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         start: str | None = None, end: str | None = None,
         project: str | None = None, model: str | None = None, root_model: str | None = None,
         contains_astra: bool = False, subagents: bool = False, min_cost: float | None = None,
+        source: str = "all",
     ):
+        source = _source(source)
         sort = sort if sort in SESSION_SORT_KEYS else "started"
         direction = "asc" if direction == "asc" else "desc"
         clauses, params = ["1=1"], []
+        if source != "all": clauses.append("s.source_app=?"); params.append(source)
         if start: clauses.append("date(s.created_at,'localtime')>=date(?)"); params.append(start)
         if end: clauses.append("date(s.created_at,'localtime')<=date(?)"); params.append(end)
         if project: clauses.append("COALESCE(s.repo_name,s.cwd)=?"); params.append(project)
@@ -269,11 +334,21 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                 conn, where=" AND ".join(clauses), params=tuple(params), order=sort,
                 direction=direction,
             )
-            projects = [r[0] for r in conn.execute("SELECT DISTINCT COALESCE(repo_name,cwd) FROM sessions WHERE COALESCE(repo_name,cwd) IS NOT NULL ORDER BY 1")]
-            models = [r[0] for r in conn.execute("SELECT DISTINCT model FROM usage ORDER BY model")]
-            roots = [r[0] for r in conn.execute("SELECT DISTINCT root_model FROM sessions WHERE root_model IS NOT NULL ORDER BY root_model")]
+            source_sql, source_values = (("", ()) if source == "all" else (" AND source_app=?", (source,)))
+            projects = [r[0] for r in conn.execute(
+                "SELECT DISTINCT COALESCE(repo_name,cwd) FROM sessions "
+                f"WHERE COALESCE(repo_name,cwd) IS NOT NULL{source_sql} ORDER BY 1", source_values
+            )]
+            usage_source, usage_values = _source_usage_clause(source)
+            models = [r[0] for r in conn.execute(
+                f"SELECT DISTINCT model FROM usage u WHERE {usage_source} ORDER BY model", usage_values
+            )]
+            roots = [r[0] for r in conn.execute(
+                "SELECT DISTINCT root_model FROM sessions WHERE root_model IS NOT NULL"
+                f"{source_sql} ORDER BY root_model", source_values
+            )]
         return render(
-            request, "sessions.html", active="sessions", rows=rows, projects=projects,
+            request, "sessions.html", active="sessions", source=source, rows=rows, projects=projects,
             models=models, roots=roots, sort_key=sort, sort_direction=direction,
             sort_links=_sort_links(request, sort, direction), sort_labels=SESSION_SORT_LABELS,
         )
@@ -283,7 +358,9 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         with database(settings.database, readonly=True) as conn:
             session = session_detail(conn, session_id)
             agents = conn.execute(
-                """SELECT a.*,COUNT(u.id) usage_events,COALESCE(SUM(u.input_tokens),0) input_tokens,
+                """SELECT a.*,
+                   COALESCE(SUM(u.id IS NOT NULL AND u.source_event_type!='claude_cost_state'),0) usage_events,
+                   COALESCE(SUM(u.input_tokens),0) input_tokens,
                    COALESCE(SUM(u.cached_input_tokens),0) cached_input_tokens,COALESCE(SUM(u.output_tokens),0) output_tokens,
                    COALESCE(SUM(u.reasoning_output_tokens),0) reasoning_tokens,COALESCE(SUM(u.total_tokens),0) total_tokens,
                    SUM(CAST(u.cost_usd AS REAL)) known_cost_usd,SUM(u.id IS NOT NULL AND u.cost_usd IS NULL) unknown_cost_records,
@@ -294,7 +371,8 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                 (session_id,),
             ).fetchall()
             model_rows = conn.execute(
-                """SELECT model,COUNT(DISTINCT thread_id) agents,COUNT(*) usage_events,SUM(input_tokens) input_tokens,
+                """SELECT model,COUNT(DISTINCT thread_id) agents,
+                   SUM(source_event_type!='claude_cost_state') usage_events,SUM(input_tokens) input_tokens,
                    SUM(cached_input_tokens) cached_input_tokens,SUM(output_tokens) output_tokens,
                    SUM(reasoning_output_tokens) reasoning_tokens,SUM(total_tokens) total_tokens,
                    SUM(CAST(cost_usd AS REAL)) known_cost_usd,SUM(cost_usd IS NULL) unknown_cost_records
@@ -324,101 +402,127 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             data["full_identity"] = data.get("response_id") or data["source_record_identity"]
             events.append(data)
         return render(
-            request, "session.html", active="sessions", session=session, agents=agent_rows,
+            request, "session.html", active="sessions", source=session["source_app"], session=session, agents=agent_rows,
             models=model_rows, model_composition=_model_composition(model_rows), events=events,
             tags=tags, refresh=10 if session["status"] == "running" else None,
         )
 
     @app.post("/sessions/{session_id}/tags")
-    def update_tags(session_id: str, tags: str = Form("")):
+    def update_tags(session_id: str, tags: str = Form(""), source: str = "all"):
         names = sorted({part.strip() for part in tags.split(",") if part.strip()})
         with database(settings.database) as conn:
             conn.execute("DELETE FROM session_tags WHERE session_id=?", (session_id,))
             for name in names:
                 conn.execute("INSERT OR IGNORE INTO tags(name) VALUES(?)", (name,))
                 conn.execute("INSERT INTO session_tags SELECT ?,id FROM tags WHERE name=?", (session_id, name))
-        return RedirectResponse(f"/sessions/{session_id}", status_code=303)
+        return RedirectResponse(f"/sessions/{session_id}?source={_source(source)}", status_code=303)
 
     @app.get("/models", response_class=HTMLResponse)
-    def models_page(request: Request):
+    def models_page(request: Request, source: str = "all"):
+        source = _source(source)
+        source_where, source_params = _source_usage_clause(source)
         with database(settings.database, readonly=True) as conn:
             rows = conn.execute(
-                """SELECT model,provider,COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
-                   COUNT(*) usage_events,
+                f"""SELECT model,provider,COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
+                   SUM(source_event_type!='claude_cost_state') usage_events,
                    SUM(total_tokens) total_tokens,SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
                    SUM(CAST(cost_usd AS REAL)) known_cost_usd,SUM(cost_usd IS NULL) unknown_cost_records,
                    SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
-                   FROM usage GROUP BY model,provider ORDER BY known_cost_usd DESC"""
+                   FROM usage u WHERE {source_where} GROUP BY model,provider ORDER BY known_cost_usd DESC""",
+                source_params,
             ).fetchall()
             daily = conn.execute(
-                """SELECT date(timestamp,'localtime'),model,SUM(CAST(cost_usd AS REAL)),SUM(cost_usd IS NULL)
-                   FROM usage GROUP BY date(timestamp,'localtime'),model ORDER BY 1,2"""
+                f"""SELECT date(timestamp,'localtime'),model,SUM(CAST(cost_usd AS REAL)),SUM(cost_usd IS NULL)
+                   FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model ORDER BY 1,2""",
+                source_params,
             ).fetchall()
         return render(
-            request, "models.html", active="models", rows=rows, daily=daily,
+            request, "models.html", active="models", source=source, rows=rows, daily=daily,
             model_composition=_model_composition(rows),
         )
 
     @app.get("/projects", response_class=HTMLResponse)
-    def projects_page(request: Request):
+    def projects_page(request: Request, source: str = "all"):
+        source = _source(source)
+        source_where = "1=1" if source == "all" else "s.source_app=?"
+        source_params = () if source == "all" else (source,)
         with database(settings.database, readonly=True) as conn:
             rows = conn.execute(
-                """SELECT COALESCE(s.repo_name,s.cwd,'unknown') project,COUNT(DISTINCT s.id) sessions,
+                f"""SELECT COALESCE(s.repo_name,s.cwd,'unknown') project,COUNT(DISTINCT s.id) sessions,
                    SUM(u.total_tokens) total_tokens,SUM(CAST(u.cost_usd AS REAL)) known_cost_usd,
                    SUM(u.cost_usd IS NULL) unknown_cost_records,
                    SUM(CAST(u.cost_usd AS REAL))/COUNT(DISTINCT s.id) average_cost,
-                   100.0*SUM(CASE WHEN u.model='gpt-5.6-sol' THEN CAST(u.cost_usd AS REAL) ELSE 0 END)/NULLIF(SUM(CAST(u.cost_usd AS REAL)),0) sol_pct,
-                   100.0*SUM(CASE WHEN u.model='gpt-5.6-terra' THEN CAST(u.cost_usd AS REAL) ELSE 0 END)/NULLIF(SUM(CAST(u.cost_usd AS REAL)),0) terra_pct,
-                   100.0*SUM(CASE WHEN u.model='gpt-5.6-luna' THEN CAST(u.cost_usd AS REAL) ELSE 0 END)/NULLIF(SUM(CAST(u.cost_usd AS REAL)),0) luna_pct,
-                   100.0*SUM(CASE WHEN u.model='gpt-6-astra' THEN CAST(u.cost_usd AS REAL) ELSE 0 END)/NULLIF(SUM(CAST(u.cost_usd AS REAL)),0) astra_pct
-                   FROM sessions s LEFT JOIN usage u ON u.session_id=s.id GROUP BY project ORDER BY known_cost_usd DESC"""
+                   COUNT(DISTINCT u.thread_id) agents,
+                   COALESCE(SUM(u.id IS NOT NULL AND u.source_event_type!='claude_cost_state'),0) usage_events,
+                   100.0*SUM(u.cached_input_tokens)/NULLIF(SUM(u.input_tokens),0) cached_pct
+                   FROM sessions s LEFT JOIN usage u ON u.session_id=s.id WHERE {source_where}
+                   GROUP BY project ORDER BY known_cost_usd DESC""",
+                source_params,
             ).fetchall()
-        return render(request, "projects.html", active="projects", rows=rows)
+        return render(request, "projects.html", active="projects", source=source, rows=rows)
 
     @app.get("/trends", response_class=HTMLResponse)
-    def trends_page(request: Request):
+    def trends_page(request: Request, source: str = "all"):
+        source = _source(source)
+        source_where, source_params = _source_usage_clause(source)
         with database(settings.database, readonly=True) as conn:
             daily = conn.execute(
-                """SELECT date(timestamp,'localtime') period,SUM(CAST(cost_usd AS REAL)) cost,
+                f"""SELECT date(timestamp,'localtime') period,SUM(CAST(cost_usd AS REAL)) cost,
                    SUM(total_tokens) tokens,COUNT(DISTINCT session_id) sessions,
                    SUM(cost_usd IS NULL) unknown_cost_records,
                    100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
                    SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
-                   FROM usage GROUP BY date(timestamp,'localtime') ORDER BY period"""
+                   FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime') ORDER BY period""",
+                source_params,
             ).fetchall()
             weekly = conn.execute(
-                """SELECT strftime('%Y-W%W',timestamp,'localtime') period,SUM(CAST(cost_usd AS REAL)) cost,
+                f"""SELECT strftime('%Y-W%W',timestamp,'localtime') period,SUM(CAST(cost_usd AS REAL)) cost,
                    SUM(total_tokens) tokens,COUNT(DISTINCT session_id) sessions,
                    SUM(cost_usd IS NULL) unknown_cost_records,
                    100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
                    SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
-                   FROM usage GROUP BY strftime('%Y-W%W',timestamp,'localtime') ORDER BY period"""
+                   FROM usage u WHERE {source_where} GROUP BY strftime('%Y-W%W',timestamp,'localtime') ORDER BY period""",
+                source_params,
             ).fetchall()
             by_model = conn.execute(
-                """SELECT date(timestamp,'localtime') period,model,SUM(CAST(cost_usd AS REAL)) cost,
+                f"""SELECT date(timestamp,'localtime') period,model,SUM(CAST(cost_usd AS REAL)) cost,
                    SUM(total_tokens) tokens,SUM(cost_usd IS NULL) unknown_cost_records
-                   FROM usage GROUP BY date(timestamp,'localtime'),model ORDER BY period,model"""
+                   FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model ORDER BY period,model""",
+                source_params,
             ).fetchall()
-        return render(request, "trends.html", active="trends", daily=daily, weekly=weekly,
+        return render(request, "trends.html", active="trends", source=source, daily=daily, weekly=weekly,
                       by_model=by_model, spend_svg=_svg_trend(daily))
 
     @app.get("/compare", response_class=HTMLResponse)
-    def compare_page(request: Request, session: list[str] = Query(default=[])):
+    def compare_page(request: Request, session: list[str] = Query(default=[]), source: str = "all"):
+        source = _source(source)
         selected = session[:4]
         with database(settings.database, readonly=True) as conn:
             rows = [session_detail(conn, sid) for sid in selected]
-            rows = [r for r in rows if r]
+            rows = [
+                row for row in rows
+                if row is not None and (source == "all" or row["source_app"] == source)
+            ]
+            selected = [row["id"] for row in rows]
             model_costs = {
                 sid: {r[0]: (r[1], r[2]) for r in conn.execute(
                     """SELECT model,SUM(CAST(cost_usd AS REAL)),SUM(cost_usd IS NULL)
                        FROM usage WHERE session_id=? GROUP BY model""", (sid,)
                 )} for sid in selected
             }
-        return render(request, "compare.html", active="compare", rows=rows, model_costs=model_costs)
+            compared_models = sorted({model for costs in model_costs.values() for model in costs})
+        return render(
+            request, "compare.html", active="compare", source=source, rows=rows,
+            model_costs=model_costs, compared_models=compared_models,
+        )
 
     @app.get("/healthz")
     def health():
-        return {"status": "ok", "database": str(settings.database), "codex_home": str(settings.codex_home)}
+        return {
+            "status": "ok", "database": str(settings.database),
+            "codex_home": str(settings.codex_home), "opencode_database": str(settings.opencode_database),
+            "claude_home": str(settings.claude_home),
+        }
 
     @app.get("/favicon.ico", include_in_schema=False)
     def favicon():

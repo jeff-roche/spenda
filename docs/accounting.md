@@ -107,3 +107,11 @@ If no price row matches, all component costs and `cost_usd` are null. Reports om
 Normal persistence did not expose all possible server billing dimensions. The MVP does not estimate tool-call fees, Batch/Flex/Fast service tiers, regional-processing uplifts, credits, taxes, or server-side adjustments. It also cannot distinguish every historical cache-write billing policy when an older model page does not publish a write rate; built-in older-model rows conservatively use the normal input rate for writes.
 
 Local totals should be reconciled with OpenAI organization Usage/Costs APIs or invoices in a future optional feature. Those APIs are not required by this dashboard.
+
+## 10. OpenCode accounting
+
+OpenCode assistant messages already contain token categories and a client-calculated cost. The dashboard imports that cost directly and does not apply its Codex price table. Cache reads and writes are added to OpenCode's uncached input, and reasoning is added to visible output, so the normalized token identities match Codex reports. See `opencode-data-sources.md` for the exact mapping and read-only boundary.
+
+## 11. Claude Code accounting
+
+Claude Code transcript usage records contain model and token categories. The importer deduplicates streaming updates by `(sessionId, message.id)` and keeps the latest record. Claude's `output_tokens` already includes thinking tokens; `thinking_tokens` is retained as a reasoning subset and is not added again. Claude `cost-state` records are cumulative, so consecutive snapshots are converted into dated cost changes whose sum equals the latest source total. This preserves historical period reporting without allocating cost to individual messages. Older or uncovered sessions remain unpriced. Subscription-backed figures are informational rather than an API invoice.

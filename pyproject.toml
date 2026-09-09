@@ -1,8 +1,10 @@
 [project]
 name = "codex-usage-dashboard"
 version = "0.1.0"
-description = "Local accounting dashboard for ordinary API-key Codex sessions"
+description = "Local accounting dashboard for Codex, OpenCode, and Claude Code sessions"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.116",
@@ -27,4 +29,3 @@ packages = ["src/codex_dashboard"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-

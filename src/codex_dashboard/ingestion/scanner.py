@@ -65,7 +65,7 @@ def _repo_from_cwd(cwd: str | None) -> tuple[str | None, str | None]:
 
 def _ensure_session(conn: sqlite3.Connection, root_id: str, settings: Settings) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO sessions(id,root_thread_id,source_codex_home) VALUES(?,?,?)",
+        "INSERT OR IGNORE INTO sessions(id,root_thread_id,source_app,source_home) VALUES(?,?,'codex',?)",
         (root_id, root_id, str(settings.codex_home)),
     )
 
@@ -101,7 +101,7 @@ def _sync_state(
                git_origin_url=COALESCE(?,git_origin_url), created_at=COALESCE(?,created_at),
                updated_at=CASE WHEN updated_at IS NULL OR ?>updated_at THEN ? ELSE updated_at END,
                root_model=COALESCE(?,root_model), root_reasoning_effort=COALESCE(?,root_reasoning_effort),
-               root_provider=COALESCE(?,root_provider), source_codex_version=COALESCE(?,source_codex_version),
+               root_provider=COALESCE(?,root_provider), source_version=COALESCE(?,source_version),
                parser_warnings=parser_warnings+?
                WHERE id=?""",
             (
@@ -300,7 +300,7 @@ def _apply_session_meta(
     conn.execute(
         """UPDATE sessions SET cwd=COALESCE(cwd,?),repo_root=COALESCE(repo_root,?),repo_name=COALESCE(repo_name,?),
            git_branch=COALESCE(git_branch,?),git_commit=COALESCE(git_commit,?),git_origin_url=COALESCE(git_origin_url,?),
-           source_codex_version=COALESCE(source_codex_version,?),root_provider=COALESCE(root_provider,?),
+           source_version=COALESCE(source_version,?),root_provider=COALESCE(root_provider,?),
            created_at=COALESCE(created_at,?) WHERE id=?""",
         (cwd, repo_root, repo_name, git.get("branch"), git.get("commit_hash"), git.get("repository_url"),
          payload.get("cli_version"), payload.get("model_provider"), source_timestamp, root),
@@ -311,10 +311,13 @@ def _reconcile_session_ownership(
     conn: sqlite3.Connection, parents: dict[str, str], settings: Settings
 ) -> None:
     """Move agents and their ledger rows together after relationship changes."""
-    for row in conn.execute("SELECT thread_id,parent_thread_id FROM agents"):
+    codex_agents = """SELECT a.thread_id,a.parent_thread_id,a.session_id,a.orphan
+                      FROM agents a JOIN sessions s ON s.id=a.session_id
+                      WHERE s.source_app='codex'"""
+    for row in conn.execute(codex_agents):
         if row["parent_thread_id"]:
             parents[row["thread_id"]] = row["parent_thread_id"]
-    for row in conn.execute("SELECT thread_id,session_id,orphan FROM agents"):
+    for row in conn.execute(codex_agents):
         thread_id = row["thread_id"]
         if thread_id not in parents and row["orphan"] and row["session_id"] != thread_id:
             root = row["session_id"]
@@ -463,7 +466,9 @@ def _scan_file(
 
 def _refresh_sessions(conn: sqlite3.Connection, settings: Settings) -> None:
     now = datetime.now(timezone.utc).timestamp()
-    rows = conn.execute("SELECT id,updated_at FROM sessions").fetchall()
+    rows = conn.execute(
+        "SELECT id,updated_at FROM sessions WHERE source_app='codex'"
+    ).fetchall()
     for row in rows:
         latest = conn.execute(
             "SELECT MAX(timestamp),COUNT(DISTINCT turn_id) FROM usage WHERE session_id=?", (row["id"],)
@@ -517,16 +522,23 @@ def ingest(settings: Settings, *, force_all: bool = False) -> IngestSummary:
         )
         _refresh_sessions(conn, settings)
         counts = conn.execute(
-            "SELECT COUNT(*),SUM(CASE WHEN parent_thread_id IS NOT NULL THEN 1 ELSE 0 END) FROM agents"
+            """SELECT COUNT(*),SUM(CASE WHEN a.parent_thread_id IS NOT NULL THEN 1 ELSE 0 END)
+               FROM agents a JOIN sessions s ON s.id=a.session_id WHERE s.source_app='codex'"""
         ).fetchone()
         summary.subagent_sessions = int(counts[1] or 0)
-        summary.root_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        summary.root_sessions = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE source_app='codex'"
+        ).fetchone()[0]
         summary.unknown_models = {
-            r[0] for r in conn.execute("SELECT DISTINCT model FROM usage WHERE model='unknown-model'")
+            r[0] for r in conn.execute(
+                """SELECT DISTINCT u.model FROM usage u JOIN sessions s ON s.id=u.session_id
+                   WHERE s.source_app='codex' AND u.model='unknown-model'"""
+            )
         }
         summary.unknown_prices.update(
             f"{r[0]}:{r[1]}" for r in conn.execute(
-                "SELECT DISTINCT provider,model FROM usage WHERE price_id IS NULL"
+                """SELECT DISTINCT u.provider,u.model FROM usage u JOIN sessions s ON s.id=u.session_id
+                   WHERE s.source_app='codex' AND u.price_id IS NULL"""
             )
         )
     return summary

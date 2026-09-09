@@ -177,7 +177,10 @@ def reprice_usage(
     conn: sqlite3.Connection, *, model: str | None = None, provider: str | None = None
 ) -> int:
     """Recalculate stored audit rows after an effective-dated price change."""
-    clauses, params = [], []
+    # OpenCode and Claude Code already provide source-owned accounting.  Never
+    # overwrite their direct costs (or Claude's zero-cost call rows that are
+    # represented by a separate cumulative cost-state record) with API prices.
+    clauses, params = ["source_event_type NOT GLOB 'opencode_*'", "source_event_type NOT GLOB 'claude_*'"], []
     if model is not None:
         clauses.append("model=?")
         params.append(model)

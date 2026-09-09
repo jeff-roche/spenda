@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import logging
+import sqlite3
 import subprocess
 import sys
 import time
@@ -13,8 +14,11 @@ from pathlib import Path
 from . import __version__
 from .config import Settings
 from .db import database, initialize
+from .ingestion.claude import discover_claude_home
 from .ingestion.codex_state import read_state
-from .ingestion.scanner import discover_rollouts, ingest
+from .ingestion.opencode import discover_opencode_database
+from .ingestion.scanner import discover_rollouts
+from .ingestion.service import ingest_all as ingest
 from .pricing import add_price, reprice_usage, seed_prices
 from .reports import as_dict, format_cost, format_tokens, iso_date, session_rows
 
@@ -23,6 +27,8 @@ log = logging.getLogger("codex_dashboard")
 
 def _add_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-home", help="Codex state directory (default: CODEX_HOME or ~/.codex)")
+    parser.add_argument("--opencode-db", help="OpenCode SQLite database (default: OPENCODE_DB or XDG data path)")
+    parser.add_argument("--claude-home", help="Claude Code directory (default: CLAUDE_CONFIG_DIR or ~/.claude)")
     parser.add_argument("--database", help="Dashboard-owned SQLite database")
     parser.add_argument("--no-preview", action="store_true", help="Do not persist first-message previews")
 
@@ -34,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     for name, help_text in (
-        ("doctor", "Inspect Codex and dashboard data sources"),
+        ("doctor", "Inspect coding-agent and dashboard data sources"),
         ("sessions", "List normalized task sessions"),
         ("prices", "List historical model prices"),
     ):
@@ -43,12 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     sessions = sub.choices["sessions"]
     sessions.add_argument("--limit", type=int, default=30)
     sessions.add_argument("--sort", choices=("time", "cost", "tokens", "duration", "agents"), default="time")
+    sessions.add_argument("--source", choices=("all", "codex", "opencode", "claude"), default="all")
 
-    ingest_p = sub.add_parser("ingest", help="Ingest new or changed ordinary Codex state")
+    ingest_p = sub.add_parser("ingest", help="Ingest new or changed coding-agent state")
     _add_config(ingest_p)
     ingest_p.add_argument("--all", action="store_true", help="Rescan complete files; deduplication remains active")
 
-    watch = sub.add_parser("watch", help="Continuously ingest ordinary Codex state")
+    watch = sub.add_parser("watch", help="Continuously ingest coding-agent state")
     _add_config(watch)
     watch.add_argument("--interval", type=float, default=10)
 
@@ -62,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config(export)
     export.add_argument("--format", choices=("csv", "json"), required=True)
     export.add_argument("--breakdown", choices=("sessions", "models"), default="sessions")
+    export.add_argument("--source", choices=("all", "codex", "opencode", "claude"), default="all")
     export.add_argument("--output", "-o", default="-")
 
     rebuild = sub.add_parser("rebuild", help="Reimport derived data while preserving dashboard metadata")
@@ -89,7 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _settings(args: argparse.Namespace) -> Settings:
-    return Settings.load(args.codex_home, args.database, not args.no_preview)
+    return Settings.load(
+        args.codex_home, args.database, not args.no_preview,
+        opencode_database=args.opencode_db,
+        claude_home=args.claude_home,
+    )
 
 
 def _prepare(settings: Settings) -> None:
@@ -100,7 +112,7 @@ def _prepare(settings: Settings) -> None:
 
 
 def _print_ingest(summary) -> None:
-    print(f"Scanned: {summary.scanned_files} rollout files")
+    print(f"Scanned: {summary.scanned_files} source files")
     print(f"Root sessions: {summary.root_sessions}")
     print(f"Subagent sessions: {summary.subagent_sessions}")
     print(f"Usage records added: {summary.usage_records}")
@@ -110,6 +122,8 @@ def _print_ingest(summary) -> None:
     print(f"Estimated spend added: ${summary.estimated_spend:.4f}")
     if summary.parser_warnings or summary.malformed_lines:
         print(f"Parser warnings: {summary.parser_warnings}; malformed lines: {summary.malformed_lines}")
+    for source, error in getattr(summary, "source_errors", {}).items():
+        print(f"{source} ingestion failed: {error}", file=sys.stderr)
 
 
 def _codex_version() -> str:
@@ -151,9 +165,31 @@ def doctor(settings: Settings) -> int:
         print(f"Earliest/latest rollout: {rollouts[0].name} / {rollouts[-1].name}")
     print(f"State DB root/child threads: {roots} / {len(snapshot.edges)}")
     print(f"Models encountered: {', '.join(models) or 'none'}")
+    opencode_path = discover_opencode_database(settings)
+    print(f"OpenCode database: {opencode_path}")
+    if opencode_path.is_file():
+        try:
+            with sqlite3.connect(f"{opencode_path.as_uri()}?mode=ro", uri=True, timeout=0.2) as source:
+                source.execute("PRAGMA query_only=ON")
+                opencode_sessions = source.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+                opencode_version = source.execute("SELECT MAX(version) FROM session").fetchone()[0]
+            print(f"OpenCode version: {opencode_version or 'unknown'}")
+            print(f"OpenCode sessions: {opencode_sessions}")
+        except sqlite3.DatabaseError as exc:
+            print(f"OpenCode source warning: {exc}")
+    else:
+        print("OpenCode source: not found (skipped)")
+    claude_home = discover_claude_home(settings)
+    print(f"Claude Code directory: {claude_home}")
+    projects = claude_home / "projects"
+    if projects.is_dir():
+        transcripts = sum(1 for _ in projects.rglob("*.jsonl"))
+        print(f"Claude Code transcripts: {transcripts}")
+    else:
+        print("Claude Code source: not found (skipped)")
     with database(settings.database) as conn:
         missing = conn.execute(
-            "SELECT DISTINCT provider||':'||model FROM usage WHERE price_id IS NULL ORDER BY 1"
+            "SELECT DISTINCT provider||':'||model FROM usage WHERE cost_usd IS NULL ORDER BY 1"
         ).fetchall()
         warnings = conn.execute("SELECT COUNT(*) FROM parser_warnings").fetchone()[0]
         resolved = conn.execute(
@@ -174,17 +210,18 @@ def doctor(settings: Settings) -> int:
     return 0
 
 
-def sessions_command(settings: Settings, limit: int, sort: str) -> int:
+def sessions_command(settings: Settings, limit: int, sort: str, source: str = "all") -> int:
     _prepare(settings)
     with database(settings.database, readonly=True) as conn:
-        rows = session_rows(conn, order=sort, limit=limit)
-    print(f"{'Started':16}  {'Task':38}  {'Project':20}  {'Models':24} {'Agents':>6} {'Tokens':>10} {'Cost':>16}")
+        where, params = (("1=1", ()) if source == "all" else ("s.source_app=?", (source,)))
+        rows = session_rows(conn, where=where, params=params, order=sort, limit=limit)
+    print(f"{'Started':16}  {'Source':8} {'Task':38}  {'Project':20}  {'Models':24} {'Agents':>6} {'Tokens':>10} {'Cost':>16}")
     for row in rows:
         title = (row["title"] or "(untitled)")[:38]
         project = (row["repo_name"] or row["cwd"] or "unknown")[-20:]
         models = (row["models_used"] or row["root_model"] or "unknown")[:24]
         print(
-            f"{iso_date(row['created_at']):16}  {title:38}  {project:20}  {models:24} "
+            f"{iso_date(row['created_at']):16}  {row['source_app']:8} {title:38}  {project:20}  {models:24} "
             f"{row['agent_count']:6d} {format_tokens(row['total_tokens']):>10} "
             f"{format_cost(row['known_cost_usd'],row['unknown_cost_records']):>16}"
         )
@@ -192,14 +229,14 @@ def sessions_command(settings: Settings, limit: int, sort: str) -> int:
 
 
 SESSION_EXPORT_FIELDS = (
-    "session_id", "date", "title", "project", "root_model", "models_used", "agent_count",
+    "session_id", "source_app", "date", "title", "project", "root_model", "models_used", "agent_count",
     "input_tokens", "cached_input_tokens", "cache_write_input_tokens", "uncached_input_tokens",
     "output_tokens", "reasoning_tokens", "total_tokens", "cost_usd", "known_cost_usd",
     "unknown_cost_records", "duration_seconds", "tags",
 )
 
 
-def _export_rows(conn, breakdown: str) -> list[dict]:
+def _export_rows(conn, breakdown: str, source: str = "all") -> list[dict]:
     def exact_cost(where: str, params: tuple) -> str | None:
         values = conn.execute(f"SELECT cost_usd FROM usage WHERE {where} AND cost_usd IS NOT NULL", params)
         total = Decimal("0")
@@ -210,14 +247,19 @@ def _export_rows(conn, breakdown: str) -> list[dict]:
         return format(total, "f") if seen else None
 
     if breakdown == "models":
+        source_where = "1=1" if source == "all" else "s.source_app=?"
+        source_params = () if source == "all" else (source,)
         rows = conn.execute(
-            """SELECT u.session_id,u.model,u.provider,COUNT(DISTINCT u.thread_id) agent_count,
-               COUNT(*) usage_events,SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
+            f"""SELECT u.session_id,s.source_app,u.model,u.provider,COUNT(DISTINCT u.thread_id) agent_count,
+               SUM(source_event_type!='claude_cost_state') usage_events,
+               SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
                SUM(cache_write_input_tokens) cache_write_input_tokens,SUM(uncached_input_tokens) uncached_input_tokens,
                SUM(output_tokens) output_tokens,SUM(reasoning_output_tokens) reasoning_tokens,
                SUM(total_tokens) total_tokens,SUM(CAST(cost_usd AS REAL)) known_cost_usd,
-               SUM(cost_usd IS NULL) unknown_cost_records FROM usage u GROUP BY u.session_id,u.model,u.provider
-               ORDER BY u.session_id,u.model"""
+               SUM(cost_usd IS NULL) unknown_cost_records FROM usage u JOIN sessions s ON s.id=u.session_id
+               WHERE {source_where} GROUP BY u.session_id,s.source_app,u.model,u.provider
+               ORDER BY u.session_id,u.model""",
+            source_params,
         ).fetchall()
         output = []
         for row in rows:
@@ -229,11 +271,13 @@ def _export_rows(conn, breakdown: str) -> list[dict]:
             output.append(data)
         return output
     output = []
-    for row in session_rows(conn):
+    session_where, session_params = (("1=1", ()) if source == "all" else ("s.source_app=?", (source,)))
+    for row in session_rows(conn, where=session_where, params=session_params):
         data = as_dict(row)
         known_exact = exact_cost("session_id=?", (data["id"],))
         output.append({
-            "session_id": data["id"], "date": data["created_at"], "title": data["title"],
+            "session_id": data["id"], "source_app": data["source_app"],
+            "date": data["created_at"], "title": data["title"],
             "project": data["repo_name"] or data["cwd"], "root_model": data["root_model"],
             "models_used": data["models_used"], "agent_count": data["agent_count"],
             "input_tokens": data["input_tokens"], "cached_input_tokens": data["cached_input_tokens"],
@@ -248,10 +292,12 @@ def _export_rows(conn, breakdown: str) -> list[dict]:
     return output
 
 
-def export_command(settings: Settings, fmt: str, breakdown: str, output_path: str) -> int:
+def export_command(
+    settings: Settings, fmt: str, breakdown: str, output_path: str, source: str = "all"
+) -> int:
     _prepare(settings)
     with database(settings.database, readonly=True) as conn:
-        rows = _export_rows(conn, breakdown)
+        rows = _export_rows(conn, breakdown, source)
     handle = sys.stdout if output_path == "-" else open(output_path, "w", newline="", encoding="utf-8")
     try:
         if fmt == "json":
@@ -292,8 +338,10 @@ def rebuild(settings: Settings, confirmed: bool) -> int:
         conn.execute("DELETE FROM agents")
         conn.execute("DELETE FROM sessions")
         conn.execute("DELETE FROM ingestion_state")
+        conn.execute("DELETE FROM source_sync_state")
         conn.execute("DELETE FROM parser_warnings")
-    _print_ingest(ingest(settings, force_all=True))
+    summary = ingest(settings, force_all=True)
+    _print_ingest(summary)
     with database(settings.database) as conn:
         for session_id, tag_name in saved_tags:
             conn.execute(
@@ -302,7 +350,7 @@ def rebuild(settings: Settings, confirmed: bool) -> int:
                      SELECT 1 FROM sessions WHERE id=?)""",
                 (session_id, tag_name, session_id),
             )
-    return 0
+    return 1 if summary.source_errors else 0
 
 
 def tag_command(settings: Settings, session_id: str, names: list[str]) -> int:
@@ -336,10 +384,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return doctor(settings)
     if args.command == "ingest":
-        _print_ingest(ingest(settings, force_all=args.all))
-        return 0
+        summary = ingest(settings, force_all=args.all)
+        _print_ingest(summary)
+        return 1 if summary.source_errors else 0
     if args.command == "sessions":
-        return sessions_command(settings, args.limit, args.sort)
+        return sessions_command(settings, args.limit, args.sort, args.source)
     if args.command == "prices":
         _prepare(settings)
         with database(settings.database, readonly=True) as conn:
@@ -377,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         uvicorn.run(create_app(settings, ingest_interval=args.interval), host=args.host, port=args.port)
         return 0
     if args.command == "export":
-        return export_command(settings, args.format, args.breakdown, args.output)
+        return export_command(settings, args.format, args.breakdown, args.output, args.source)
     if args.command == "rebuild":
         return rebuild(settings, args.yes)
     if args.command == "tag":

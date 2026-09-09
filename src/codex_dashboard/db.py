@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -32,8 +32,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     root_model TEXT,
     root_reasoning_effort TEXT,
     root_provider TEXT,
-    source_codex_home TEXT NOT NULL,
-    source_codex_version TEXT,
+    source_app TEXT NOT NULL DEFAULT 'codex',
+    source_home TEXT NOT NULL,
+    source_version TEXT,
     turn_count INTEGER NOT NULL DEFAULT 0,
     parser_warnings INTEGER NOT NULL DEFAULT 0,
     accounting_status TEXT NOT NULL DEFAULT 'complete',
@@ -128,6 +129,13 @@ CREATE TABLE IF NOT EXISTS ingestion_state (
     pending_call_label TEXT,
     pending_call_priority INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS source_sync_state (
+    source_app TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    cursor_timestamp INTEGER NOT NULL DEFAULT 0,
+    last_successful_ingestion TEXT,
+    PRIMARY KEY(source_app, source_path)
+);
 CREATE TABLE IF NOT EXISTS parser_warnings (
     id INTEGER PRIMARY KEY,
     source_key TEXT,
@@ -147,6 +155,7 @@ CREATE TABLE IF NOT EXISTS session_tags (
     PRIMARY KEY(session_id, tag_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_source_created ON sessions(source_app, created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(repo_name, cwd);
 CREATE INDEX IF NOT EXISTS idx_sessions_root_model ON sessions(root_model);
 CREATE INDEX IF NOT EXISTS idx_agents_session ON agents(session_id);
@@ -176,6 +185,23 @@ def connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_session_source_columns(conn: sqlite3.Connection) -> None:
+    """Upgrade the v3 Codex-specific session provenance columns in place."""
+    session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if not session_columns:
+        return
+    if "source_codex_home" in session_columns and "source_home" not in session_columns:
+        conn.execute("ALTER TABLE sessions RENAME COLUMN source_codex_home TO source_home")
+        session_columns.remove("source_codex_home")
+        session_columns.add("source_home")
+    if "source_codex_version" in session_columns and "source_version" not in session_columns:
+        conn.execute("ALTER TABLE sessions RENAME COLUMN source_codex_version TO source_version")
+        session_columns.remove("source_codex_version")
+        session_columns.add("source_version")
+    if "source_app" not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN source_app TEXT NOT NULL DEFAULT 'codex'")
+
+
 def initialize(path: Path) -> None:
     if path.exists() and path.stat().st_size:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2) as existing:
@@ -183,6 +209,9 @@ def initialize(path: Path) -> None:
         if tables and "dashboard_meta" not in tables:
             raise ValueError(f"refusing to modify a non-dashboard SQLite database: {path}")
     with connect(path) as conn:
+        # Upgrade before applying the complete schema, which includes an index
+        # over ``source_app`` that does not exist in v3.
+        _migrate_session_source_columns(conn)
         conn.executescript(SCHEMA)
         session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
         if "accounting_status" not in session_columns:
