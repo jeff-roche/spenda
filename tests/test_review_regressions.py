@@ -210,6 +210,23 @@ def test_session_page_shows_safe_call_action_when_available(dashboard_settings):
     assert "Call #001 · Run tests" in body
 
 
+def test_sessions_table_has_top_scrolling_compact_models_and_pinned_cost(dashboard_settings):
+    _root(dashboard_settings)
+    ingest(dashboard_settings)
+    app = create_app(dashboard_settings)
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/sessions", "headers": [], "query_string": b"", "app": app}
+    )
+    route = next(route.endpoint for route in app.routes if route.path == "/sessions")
+    body = route(request).body.decode().split("<main>", 1)[1]
+
+    assert 'class="table-scroll-top"' in body
+    assert 'aria-label="Scroll columns right"' in body
+    assert 'class="model-pill model-sol-text">gpt-5.6-sol</span>' in body
+    assert 'class="cost-column ">' in body
+    assert body.index("Duration</a>") < body.index("Cost</a>")
+
+
 def test_task_sorting_uses_raw_numeric_values_for_every_column(dashboard_settings):
     directory = dashboard_settings.codex_home / "sessions" / "2026" / "09" / "08"
     state_rows = []

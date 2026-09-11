@@ -32,7 +32,7 @@ def _line(*, kind: str, session: str, timestamp: str, **extra) -> str:
 
 def _assistant(
     *, session: str, message_id: str, timestamp: str, input_tokens: int, output_tokens: int,
-    git_branch: str | None = None, effort: str | None = None,
+    git_branch: str | None = None, effort: str | None = None, content: object | None = None,
 ) -> str:
     metadata = {}
     if git_branch is not None:
@@ -45,7 +45,7 @@ def _assistant(
         message={
             "id": message_id, "model": "claude-test", "role": "assistant",
             # The text must never be copied into dashboard fields.
-            "content": "private assistant response",
+            "content": "private assistant response" if content is None else content,
             "usage": {
                 "input_tokens": input_tokens, "cache_read_input_tokens": 2,
                 "cache_creation_input_tokens": 3, "output_tokens": output_tokens,
@@ -143,6 +143,60 @@ def test_claude_ingestion_keeps_only_accounting_and_latest_message(tmp_path):
 
     second = ingest_claude(settings)
     assert (second.usage_records, second.duplicate_records) == (0, 3)
+
+
+def test_claude_derives_fixed_action_labels_without_persisting_content(tmp_path):
+    home = tmp_path / "claude"
+    root = home / "projects" / "-work-repo" / "root.jsonl"
+    root.parent.mkdir(parents=True)
+    tool_snapshot = _assistant(
+        session="root", message_id="tool-message", timestamp="2026-09-01T10:00:00Z",
+        input_tokens=1, output_tokens=1,
+        content=[
+            {"type": "thinking", "thinking": "private reasoning"},
+            {"type": "tool_use", "name": "Edit", "input": {
+                "file_path": "/private/file", "new_string": "private replacement"
+            }},
+        ],
+    )
+    # Streaming may replace the content blocks while retaining the message ID;
+    # keep the strongest safe label while using the latest accounting values.
+    final_snapshot = _assistant(
+        session="root", message_id="tool-message", timestamp="2026-09-01T10:00:01Z",
+        input_tokens=2, output_tokens=2,
+        content=[{"type": "text", "text": "private final response"}],
+    )
+    text_message = _assistant(
+        session="root", message_id="text-message", timestamp="2026-09-01T10:00:02Z",
+        input_tokens=3, output_tokens=3,
+        content=[{"type": "text", "text": "another private response"}],
+    )
+    root.write_text("\n".join((tool_snapshot, final_snapshot, text_message)) + "\n", encoding="utf-8")
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+
+    ingest_claude(settings)
+
+    with database(settings.database, readonly=True) as conn:
+        labels = dict(conn.execute(
+            "SELECT source_record_identity,call_label FROM usage "
+            "WHERE source_event_type='claude_assistant_message' ORDER BY source_record_identity"
+        ))
+        latest_tokens = conn.execute(
+            "SELECT input_tokens,output_tokens FROM usage "
+            "WHERE source_record_identity='claude:root:root:tool-message'"
+        ).fetchone()
+    assert labels == {
+        "claude:root:root:text-message": "Assistant response",
+        "claude:root:root:tool-message": "Apply file change",
+    }
+    assert tuple(latest_tokens) == (7, 2)
+    with sqlite3.connect(settings.database) as conn:
+        logical_dump = "\n".join(conn.iterdump())
+    for private_value in (
+        "private reasoning", "/private/file", "private replacement",
+        "private final response", "another private response",
+    ):
+        assert private_value not in logical_dump
 
 
 @pytest.mark.parametrize(

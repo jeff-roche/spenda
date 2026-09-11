@@ -1,8 +1,9 @@
 """Read-only ingestion of OpenCode's SQLite session ledger.
 
 The adapter deliberately queries scalar JSON fields from ``message.data`` in
-SQLite.  It never selects message data itself and never reads OpenCode's
-``part`` or ``credential`` tables, so prompts, responses, tool output, and
+SQLite. For action labels it extracts only part types and tool names from
+``part.data``. It never selects either JSON document itself and never reads the
+``credential`` table, so prompts, responses, tool arguments/output, and
 credentials do not enter the dashboard database.
 """
 
@@ -18,6 +19,7 @@ from typing import Any, Iterable
 
 from ..config import Settings
 from ..db import database, initialize
+from .action_labels import prefer_action_label, safe_action_label
 
 
 PARSER_VERSION = 1
@@ -342,7 +344,7 @@ def _source_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def _message_rows(
     conn: sqlite3.Connection, cursor_timestamp: int | None = None
 ) -> Iterable[sqlite3.Row]:
-    # data is intentionally absent from SELECT.  JSON extraction occurs within
+    # data is intentionally absent from SELECT. JSON extraction occurs within
     # SQLite and returns only role/model/usage scalar values to Python.
     cursor_where = "" if cursor_timestamp is None else "AND m.time_updated>=?"
     params = () if cursor_timestamp is None else (cursor_timestamp,)
@@ -366,6 +368,34 @@ def _message_rows(
            ORDER BY m.time_updated,m.id""",
         params,
     )
+
+
+def _message_action_labels(conn: sqlite3.Connection) -> dict[str, str]:
+    """Read only part type/tool-name scalars, never part content or arguments."""
+
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    required = {"id", "message_id", "time_created", "data"}
+    if "part" not in tables or not required.issubset(_columns(conn, "part")):
+        return {}
+    labels: dict[str, str] = {}
+    rows = conn.execute(
+        """SELECT p.message_id,
+                  json_extract(p.data,'$.type') AS part_type,
+                  CASE WHEN json_extract(p.data,'$.type')='tool'
+                       THEN json_extract(p.data,'$.tool') END AS tool_name
+           FROM part p JOIN message m ON m.id=p.message_id
+           WHERE json_valid(p.data) AND json_extract(m.data,'$.role')='assistant'
+           ORDER BY p.time_created,p.id"""
+    )
+    for row in rows:
+        message_id = str(row["message_id"])
+        labels[message_id] = prefer_action_label(
+            labels.get(message_id), safe_action_label(row["part_type"], row["tool_name"])
+        ) or "Assistant response"
+    return labels
 
 
 def _source_message_ids(conn: sqlite3.Connection) -> tuple[set[str], int]:
@@ -504,8 +534,17 @@ def ingest_opencode(settings: Settings, force_all: bool = False) -> OpenCodeInge
                    WHERE source_app=? AND source_path=?""",
                 (SOURCE_APP, str(source_path)),
             ).fetchone()
-            cursor_timestamp = None if force_all or sync is None else int(sync[0])
+            needs_label_backfill = target.execute(
+                """SELECT EXISTS(
+                       SELECT 1 FROM usage
+                       WHERE source_event_type='opencode_assistant_message'
+                         AND source_file=? AND call_label IS NULL
+                   )""",
+                (str(source_path),),
+            ).fetchone()[0]
+            cursor_timestamp = None if force_all or sync is None or needs_label_backfill else int(sync[0])
             source_message_ids, latest_message_timestamp = _source_message_ids(source)
+            action_labels = _message_action_labels(source)
             for ordinal, row in enumerate(_message_rows(source, cursor_timestamp)):
                 external_session_id = str(row["session_id"])
                 root_external_id, _ = root_info[external_session_id]
@@ -517,6 +556,7 @@ def ingest_opencode(settings: Settings, force_all: bool = False) -> OpenCodeInge
                 identity = _ns(str(row["id"]))
                 model = str(row["model"] or row["session_model"] or "unknown-model")
                 provider = str(row["provider"] or row["session_provider"] or "unknown-provider")
+                call_label = action_labels.get(str(row["id"]), "Assistant response")
                 normalized_input = raw_input + cached + cache_write
                 normalized_output = raw_output + reasoning
                 source_total = _nonnegative_int(row["token_total"])
@@ -526,7 +566,7 @@ def ingest_opencode(settings: Settings, force_all: bool = False) -> OpenCodeInge
                     _timestamp(row["time_created"]) or _timestamp(row["time_updated"]) or datetime.now(UTC).isoformat(),
                     model, provider, normalized_input, cached, cache_write, raw_input,
                     normalized_output, reasoning, total, str(source_path),
-                    ordinal, "opencode_assistant_message", None, None, None, None, None, None,
+                    ordinal, "opencode_assistant_message", call_label, None, None, None, None, None,
                     format(_cost(row["cost"]), "f"), "reported by OpenCode",
                 )
                 exists = target.execute(
@@ -548,7 +588,7 @@ def ingest_opencode(settings: Settings, force_all: bool = False) -> OpenCodeInge
                          uncached_input_tokens=excluded.uncached_input_tokens,output_tokens=excluded.output_tokens,
                          reasoning_output_tokens=excluded.reasoning_output_tokens,total_tokens=excluded.total_tokens,
                          source_file=excluded.source_file,source_ordinal=excluded.source_ordinal,
-                         source_event_type=excluded.source_event_type,price_id=NULL,
+                         source_event_type=excluded.source_event_type,call_label=excluded.call_label,price_id=NULL,
                          uncached_input_usd=NULL,cached_input_usd=NULL,cache_write_usd=NULL,output_usd=NULL,
                          cost_usd=excluded.cost_usd,pricing_note=excluded.pricing_note""",
                     values,

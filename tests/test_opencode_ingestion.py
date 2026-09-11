@@ -27,6 +27,10 @@ def _source_db(path: Path) -> None:
               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
               time_updated INTEGER NOT NULL, data TEXT NOT NULL
             );
+            CREATE TABLE part(
+              id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+              time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+            );
             """
         )
         conn.execute(
@@ -65,6 +69,25 @@ def _source_db(path: Path) -> None:
             "INSERT INTO message VALUES(?,?,?,?,?)",
             ("user-message", "root", 4000, 4000, json.dumps({"role": "user"})),
         )
+        parts = (
+            (
+                "part-root", "message-root", "root",
+                {"type": "tool", "tool": "bash", "state": {"input": {"command": "private-command"}}},
+            ),
+            (
+                "part-child", "message-child", "child",
+                {"type": "tool", "tool": "read", "state": {"input": {"filePath": "/private/file"}}},
+            ),
+            (
+                "part-grandchild", "message-grandchild", "grandchild",
+                {"type": "text", "text": "private assistant response"},
+            ),
+        )
+        for ordinal, (part_id, message_id, session_id, data) in enumerate(parts):
+            conn.execute(
+                "INSERT INTO part VALUES(?,?,?,?,?,?)",
+                (part_id, message_id, session_id, 5000 + ordinal, 5000 + ordinal, json.dumps(data)),
+            )
 
 
 def _settings(tmp_path: Path, source: Path) -> Settings:
@@ -92,6 +115,9 @@ def test_opencode_paths_totals_and_turn_count(tmp_path):
         turns = conn.execute(
             "SELECT turn_count FROM sessions WHERE id='opencode:root'"
         ).fetchone()[0]
+        labels = dict(conn.execute(
+            "SELECT source_record_identity,call_label FROM usage ORDER BY source_record_identity"
+        ))
 
     assert paths == {
         "opencode:root": "/root",
@@ -100,6 +126,35 @@ def test_opencode_paths_totals_and_turn_count(tmp_path):
     }
     assert tuple(usage) == (60, 20, 30, 10, 45, 5, 105, "0.25")
     assert turns == 3
+    assert labels == {
+        "opencode:message-child": "Read files",
+        "opencode:message-grandchild": "Assistant response",
+        "opencode:message-root": "Run command",
+    }
+    with sqlite3.connect(settings.database) as conn:
+        logical_dump = "\n".join(conn.iterdump())
+    assert "private-command" not in logical_dump
+    assert "/private/file" not in logical_dump
+    assert "private assistant response" not in logical_dump
+
+
+def test_opencode_backfills_labels_for_existing_usage(tmp_path):
+    source = tmp_path / "opencode.sqlite"
+    _source_db(source)
+    settings = _settings(tmp_path, source)
+    ingest_opencode(settings)
+    with database(settings.database) as conn:
+        conn.execute(
+            "UPDATE usage SET call_label=NULL WHERE source_event_type='opencode_assistant_message'"
+        )
+
+    ingest_opencode(settings)
+
+    with database(settings.database, readonly=True) as conn:
+        labels = [row[0] for row in conn.execute(
+            "SELECT call_label FROM usage WHERE source_event_type='opencode_assistant_message'"
+        )]
+    assert all(labels)
 
 
 def test_opencode_reconciles_removed_rows_without_touching_other_source(tmp_path):

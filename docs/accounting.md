@@ -18,7 +18,7 @@ Every normalized row recomputes `total_tokens = input_tokens + output_tokens`. L
 - prompts, response bodies, reasoning bodies, tool arguments/output, patches, world state, and unknown event kinds are ignored;
 - `threads.tokens_used` is diagnostic only and is not another usage record.
 
-The parser may retain one fixed, non-content action label alongside a usage row when adjacent persisted metadata identifies the response as a test run, file change, image inspection, command, file search/read, web search, assistant update, or final response. It does not retain the command, filenames, message text, arguments, or output. When the association is ambiguous, the label remains null and the UI shows only its sequential call marker.
+The adapters may retain one fixed, non-content action label alongside a usage row when persisted metadata identifies the response as a test run, file change, image inspection, command, file search/read, web action, subagent action, assistant response, or similar fixed category. OpenCode and Claude Code labels use only content-block/part types and tool names. The dashboard does not retain the command, filenames, message text, arguments, or output. When the association is ambiguous, the label remains null and the UI shows only its sequential call marker.
 
 ## 3. Incremental versus cumulative semantics
 

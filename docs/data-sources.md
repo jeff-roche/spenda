@@ -34,10 +34,12 @@ OpenCode is discovered from `OPENCODE_DB`, or from
 `PRAGMA query_only=ON`.
 
 It reads session and project metadata from `session` and `project`, plus scalar
-assistant accounting fields extracted from `message.data`. It does not read the
-`part` or `credential` tables. Top-level sessions become dashboard tasks;
-sessions with `parent_id` become nested agents. Imported identifiers are
-prefixed with `opencode:`.
+assistant accounting fields extracted from `message.data`. When available, it
+also extracts only the part type and tool name from `part.data` to produce a
+fixed action label; it never selects part content, tool arguments, or output,
+and never reads the `credential` table. Top-level sessions become dashboard
+tasks; sessions with `parent_id` become nested agents. Imported identifiers
+are prefixed with `opencode:`.
 
 Each assistant message is one usage row, keyed by its stable message ID.
 `tokens.input`, cache reads, cache writes, output, and reasoning are normalized
@@ -63,7 +65,9 @@ Subagent transcripts are read from:
 
 Root transcripts become dashboard tasks and subagent transcripts become agents
 under their root. Imported identifiers are prefixed with `claude:`. The adapter
-uses transcript envelope metadata and scalar assistant fields only.
+uses transcript envelope metadata and scalar assistant fields. It also inspects
+only assistant content-block types and tool names to produce a fixed action
+label; content bodies and tool arguments are discarded.
 
 Assistant usage is keyed by `(sessionId, message.id)`. Streaming updates for
 the same message keep the latest record. Uncached input, cache-read input,

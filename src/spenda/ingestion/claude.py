@@ -1,8 +1,9 @@
 """Privacy-preserving, read-only ingestion of Claude Code transcripts.
 
-Only transcript envelope metadata and assistant accounting fields are read.
-Prompt text, assistant content, tool results, attachments, credentials, and
-every other message payload are deliberately ignored and never persisted.
+Only transcript envelope metadata, assistant accounting fields, content-block
+types, and tool names are retained. Prompt text, assistant content bodies, tool
+arguments/results, attachments, credentials, and every other message payload
+are deliberately ignored and never persisted.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Any
 
 from ..config import Settings
 from ..db import database, initialize
+from .action_labels import prefer_action_label, safe_action_label
 
 
 SOURCE_APP = "claude"
@@ -76,6 +78,7 @@ class _AssistantRecord:
     usage: dict[str, Any]
     source_path: Path
     ordinal: int
+    call_label: str
 
 
 @dataclass(slots=True)
@@ -228,6 +231,22 @@ def _update_metadata(transcript: _Transcript, record: dict[str, Any]) -> None:
         transcript.reasoning_effort = transcript.reasoning_effort or effort
 
 
+def _assistant_action_label(message: dict[str, Any]) -> str:
+    """Inspect only block types and tool names; never retain block content."""
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return "Assistant response"
+    blocks = content if isinstance(content, list) else ()
+    label = None
+    for block in blocks:
+        if isinstance(block, dict):
+            label = prefer_action_label(
+                label, safe_action_label(block.get("type"), block.get("name"))
+            )
+    return label or "Assistant response"
+
+
 def _read_transcript(
     transcript: _Transcript,
     summary: ClaudeIngestSummary,
@@ -274,11 +293,15 @@ def _read_transcript(
                     continue
                 transcript.root_model = transcript.root_model or model
                 identity = _ns(f"{transcript.root_external_id}:{transcript.agent_external_id or 'root'}:{message_id}")
+                call_label = _assistant_action_label(message)
+                previous = assistant.get(identity)
+                if previous is not None:
+                    call_label = prefer_action_label(previous.call_label, call_label) or call_label
                 # Same message appears several times while streaming.  Keeping
                 # the latest transcript line avoids the observed overcounting.
                 assistant[identity] = _AssistantRecord(
                     identity, _ns(transcript.root_external_id), transcript.thread_id,
-                    timestamp, model, usage, transcript.path, ordinal,
+                    timestamp, model, usage, transcript.path, ordinal, call_label,
                 )
             elif kind == "cost-state" and not transcript.is_subagent:
                 model_usage = record.get("modelUsage")
@@ -373,7 +396,8 @@ def _usage_values(record: _AssistantRecord, *, covered_by_cost_state: bool) -> t
         record.identity, record.session_id, record.thread_id, record.identity, record.identity,
         record.timestamp, record.model, "anthropic", uncached + cached + cache_write, cached,
         cache_write, uncached, output, reasoning, uncached + cached + cache_write + output,
-        str(record.source_path), record.ordinal, _ASSISTANT_EVENT, None, None, None, None, None, None,
+        str(record.source_path), record.ordinal, _ASSISTANT_EVENT, record.call_label,
+        None, None, None, None, None,
         "0" if covered_by_cost_state else None,
         "cost represented by cumulative Claude Code cost-state" if covered_by_cost_state
         else "Claude transcript has no complete cumulative cost-state",
@@ -398,7 +422,8 @@ def _upsert_usage(conn, values: tuple[Any, ...]) -> bool:
              uncached_input_tokens=excluded.uncached_input_tokens,output_tokens=excluded.output_tokens,
              reasoning_output_tokens=excluded.reasoning_output_tokens,total_tokens=excluded.total_tokens,
              source_file=excluded.source_file,source_ordinal=excluded.source_ordinal,
-             source_event_type=excluded.source_event_type,price_id=NULL,uncached_input_usd=NULL,
+             source_event_type=excluded.source_event_type,call_label=excluded.call_label,
+             price_id=NULL,uncached_input_usd=NULL,
              cached_input_usd=NULL,cache_write_usd=NULL,output_usd=NULL,cost_usd=excluded.cost_usd,
              pricing_note=excluded.pricing_note""",
         values,
