@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Iterator
-
 
 SCHEMA_VERSION = 5
 

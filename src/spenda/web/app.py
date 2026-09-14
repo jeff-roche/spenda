@@ -5,8 +5,8 @@ import logging
 import statistics
 import threading
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
 
@@ -130,7 +130,7 @@ def _period_boundary(period: str, now: datetime | None = None) -> str | None:
         start = local_now - timedelta(days=7)
     else:
         start = local_now - timedelta(days=30)
-    return start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return start.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _period_clause(period: str, source: str = "all") -> tuple[str, tuple[Any, ...]]:
@@ -239,6 +239,7 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
     initialize(settings.database)
     with database(settings.database) as conn:
         seed_prices(conn)
+
     def refresh() -> None:
         try:
             ingest(settings)
@@ -319,14 +320,30 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         sort = sort if sort in SESSION_SORT_KEYS else "started"
         direction = "asc" if direction == "asc" else "desc"
         clauses, params = ["1=1"], []
-        if source != "all": clauses.append("s.source_app=?"); params.append(source)
-        if start: clauses.append("date(s.created_at,'localtime')>=date(?)"); params.append(start)
-        if end: clauses.append("date(s.created_at,'localtime')<=date(?)"); params.append(end)
-        if project: clauses.append("COALESCE(s.repo_name,s.cwd)=?"); params.append(project)
-        if model: clauses.append("EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id AND uf.model=?)"); params.append(model)
-        if root_model: clauses.append("s.root_model=?"); params.append(root_model)
-        if contains_astra: clauses.append("EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id AND uf.model='gpt-6-astra')")
-        if subagents: clauses.append("EXISTS(SELECT 1 FROM agents af WHERE af.session_id=s.id AND af.parent_thread_id IS NOT NULL)")
+        if source != "all":
+            clauses.append("s.source_app=?")
+            params.append(source)
+        if start:
+            clauses.append("date(s.created_at,'localtime')>=date(?)")
+            params.append(start)
+        if end:
+            clauses.append("date(s.created_at,'localtime')<=date(?)")
+            params.append(end)
+        if project:
+            clauses.append("COALESCE(s.repo_name,s.cwd)=?")
+            params.append(project)
+        if model:
+            clauses.append("EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id AND uf.model=?)")
+            params.append(model)
+        if root_model:
+            clauses.append("s.root_model=?")
+            params.append(root_model)
+        if contains_astra:
+            clauses.append("EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id AND uf.model='gpt-6-astra')")
+        if subagents:
+            clauses.append(
+                "EXISTS(SELECT 1 FROM agents af WHERE af.session_id=s.id AND af.parent_thread_id IS NOT NULL)"
+            )
         if min_cost is not None:
             clauses.append("COALESCE((SELECT SUM(CAST(cost_usd AS REAL)) FROM usage uf WHERE uf.session_id=s.id),0)>=?")
             params.append(min_cost)
@@ -362,10 +379,14 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                 """SELECT a.*,
                    COALESCE(SUM(u.id IS NOT NULL AND u.source_event_type!='claude_cost_state'),0) usage_events,
                    COALESCE(SUM(u.input_tokens),0) input_tokens,
-                   COALESCE(SUM(u.cached_input_tokens),0) cached_input_tokens,COALESCE(SUM(u.output_tokens),0) output_tokens,
-                   COALESCE(SUM(u.reasoning_output_tokens),0) reasoning_tokens,COALESCE(SUM(u.total_tokens),0) total_tokens,
-                   SUM(CAST(u.cost_usd AS REAL)) known_cost_usd,SUM(u.id IS NOT NULL AND u.cost_usd IS NULL) unknown_cost_records,
-                   CAST(strftime('%s',COALESCE(MAX(u.timestamp),a.updated_at))-strftime('%s',COALESCE(MIN(u.timestamp),a.created_at)) AS INTEGER) duration_seconds,
+                   COALESCE(SUM(u.cached_input_tokens),0) cached_input_tokens,
+                   COALESCE(SUM(u.output_tokens),0) output_tokens,
+                   COALESCE(SUM(u.reasoning_output_tokens),0) reasoning_tokens,
+                   COALESCE(SUM(u.total_tokens),0) total_tokens,
+                   SUM(CAST(u.cost_usd AS REAL)) known_cost_usd,
+                   SUM(u.id IS NOT NULL AND u.cost_usd IS NULL) unknown_cost_records,
+                   CAST(strftime('%s',COALESCE(MAX(u.timestamp),a.updated_at))
+                        -strftime('%s',COALESCE(MIN(u.timestamp),a.created_at)) AS INTEGER) duration_seconds,
                    GROUP_CONCAT(DISTINCT u.model) models_used
                    FROM agents a LEFT JOIN usage u ON u.thread_id=a.thread_id WHERE a.session_id=?
                    GROUP BY a.thread_id ORDER BY COALESCE(a.agent_path,'/root'),a.created_at""",
@@ -384,7 +405,8 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                 "SELECT * FROM usage WHERE session_id=? ORDER BY timestamp,source_ordinal LIMIT 500", (session_id,)
             ).fetchall()
             tags = [r[0] for r in conn.execute(
-                "SELECT t.name FROM tags t JOIN session_tags st ON st.tag_id=t.id WHERE st.session_id=? ORDER BY t.name",
+                "SELECT t.name FROM tags t JOIN session_tags st ON st.tag_id=t.id "
+                "WHERE st.session_id=? ORDER BY t.name",
                 (session_id,),
             )]
         if session is None:
@@ -403,7 +425,8 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             data["full_identity"] = data.get("response_id") or data["source_record_identity"]
             events.append(data)
         return render(
-            request, "session.html", active="sessions", source=session["source_app"], session=session, agents=agent_rows,
+            request, "session.html", active="sessions", source=session["source_app"], session=session,
+            agents=agent_rows,
             models=model_rows, model_composition=_model_composition(model_rows), events=events,
             tags=tags, refresh=10 if session["status"] == "running" else None,
         )
@@ -428,7 +451,8 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             rows = conn.execute(
                 f"""SELECT model,provider,COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
                    SUM(source_event_type!='claude_cost_state') usage_events,
-                   SUM(total_tokens) total_tokens,SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
+                   SUM(total_tokens) total_tokens,SUM(input_tokens) input_tokens,
+                   SUM(cached_input_tokens) cached_input_tokens,
                    SUM(CAST(cost_usd AS REAL)) known_cost_usd,SUM(cost_usd IS NULL) unknown_cost_records,
                    SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
                    FROM usage u WHERE {source_where} GROUP BY model,provider ORDER BY known_cost_usd DESC""",

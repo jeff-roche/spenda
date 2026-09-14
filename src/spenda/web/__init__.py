@@ -1,2 +1,1 @@
 """Server-rendered web dashboard."""
-

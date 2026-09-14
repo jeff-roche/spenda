@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from ..config import Settings
 from .claude import ClaudeIngestSummary, discover_claude_home, ingest_claude
 from .opencode import OpenCodeIngestSummary, ingest_opencode
-from .scanner import IngestSummary, ingest as ingest_codex
-
+from .scanner import IngestSummary
+from .scanner import ingest as ingest_codex
 
 log = logging.getLogger(__name__)
 

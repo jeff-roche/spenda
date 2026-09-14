@@ -4,7 +4,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +25,7 @@ def _utc(value: Any, milliseconds: bool = False) -> str | None:
         return None
     try:
         number = float(value) / (1000 if milliseconds else 1)
-        return datetime.fromtimestamp(number, timezone.utc).isoformat().replace("+00:00", "Z")
+        return datetime.fromtimestamp(number, UTC).isoformat().replace("+00:00", "Z")
     except (TypeError, ValueError, OSError):
         return None
 
@@ -34,6 +34,7 @@ def find_state_database(codex_home: Path) -> Path | None:
     candidates = list(codex_home.glob("state_*.sqlite"))
     if not candidates:
         return None
+
     def generation(path: Path) -> tuple[int, int]:
         try:
             number = int(path.stem.rsplit("_", 1)[1])

@@ -27,7 +27,7 @@ class Settings:
     opencode_database: Path = field(default_factory=_default_opencode_database)
     claude_home: Path = field(default_factory=_default_claude_home)
 
-    def validate(self) -> "Settings":
+    def validate(self) -> Settings:
         """Reject configurations that could write into source-owned state."""
         codex_home = self.codex_home.resolve()
         database = self.database.resolve()
@@ -57,7 +57,7 @@ class Settings:
         keep_preview: bool = True,
         opencode_database: str | Path | None = None,
         claude_home: str | Path | None = None,
-    ) -> "Settings":
+    ) -> Settings:
         home = Path(codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
         data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
         db = Path(

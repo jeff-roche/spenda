@@ -20,7 +20,6 @@ from ..config import Settings
 from ..db import database, initialize
 from .action_labels import prefer_action_label, safe_action_label
 
-
 SOURCE_APP = "claude"
 _PREFIX = "claude:"
 _ASSISTANT_EVENT = "claude_assistant_message"
@@ -197,7 +196,8 @@ def _safe_cost(value: Any) -> Decimal | None:
 def _timestamp(value: Any) -> str | None:
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC).isoformat().replace("+00:00", "Z")
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
         except ValueError:
             return None
     try:
@@ -450,8 +450,10 @@ def _upsert_transcript(conn, transcript: _Transcript, source_home: Path, root_se
             transcript.thread_id, root_id,
             root_id if transcript.is_subagent else None,
             "subagent" if transcript.is_subagent else "root",
-            transcript.agent_external_id, f"/root/{transcript.agent_external_id}" if transcript.is_subagent else "/root",
-            transcript.created_at, transcript.updated_at, transcript.root_model, "anthropic", transcript.reasoning_effort,
+            transcript.agent_external_id,
+            f"/root/{transcript.agent_external_id}" if transcript.is_subagent else "/root",
+            transcript.created_at, transcript.updated_at, transcript.root_model, "anthropic",
+            transcript.reasoning_effort,
             str(transcript.path), SOURCE_APP, int(transcript.is_subagent and not root_seen),
         ),
     )

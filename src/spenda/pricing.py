@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from .models import CostResult, TokenUsage
@@ -104,7 +104,7 @@ def seed_prices(conn: sqlite3.Connection) -> None:
 
 def _iso(value: str) -> str:
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC).isoformat().replace("+00:00", "Z")
     except (TypeError, ValueError):
         return value
 
@@ -143,8 +143,12 @@ def calculate_cost(
         output_multiplier = Decimal(price["long_output_multiplier"])
         note = f"long-context multipliers applied above {threshold} input tokens"
     uncached = Decimal(usage.uncached_input_tokens) * Decimal(price["input_per_million"]) * input_multiplier / MILLION
-    cached = Decimal(usage.cached_input_tokens) * Decimal(price["cached_input_per_million"]) * input_multiplier / MILLION
-    write = Decimal(usage.cache_write_input_tokens) * Decimal(price["cache_write_per_million"]) * input_multiplier / MILLION
+    cached = (
+        Decimal(usage.cached_input_tokens) * Decimal(price["cached_input_per_million"]) * input_multiplier / MILLION
+    )
+    write = (
+        Decimal(usage.cache_write_input_tokens) * Decimal(price["cache_write_per_million"]) * input_multiplier / MILLION
+    )
     output = Decimal(usage.output_tokens) * Decimal(price["output_per_million"]) * output_multiplier / MILLION
     total = uncached + cached + write + output
     return CostResult(price["id"], uncached, cached, write, output, total, note)

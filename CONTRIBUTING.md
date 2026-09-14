@@ -67,6 +67,16 @@ uv lock --check
 uv build
 ```
 
+Run the linters, which CI also runs on every push and pull request:
+
+```bash
+scripts/lint.sh          # ruff and flake8
+scripts/ruff.sh --fix    # ruff only, applying safe autofixes
+scripts/flake8.sh        # flake8 only
+```
+
+Both linters read their settings from the repository (`[tool.ruff]` in `pyproject.toml` and `.flake8`) with a 120-character line limit.
+
 For web changes, exercise each affected source filter and check both light and dark themes at narrow and wide widths. For accounting changes, verify exact raw totals in SQLite as well as formatted output.
 
 Before submitting, confirm that `git diff --check` reports no whitespace errors.

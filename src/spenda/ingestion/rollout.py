@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -233,7 +233,10 @@ def _tool_call_label(name: Any, raw_input: Any) -> str:
         return "Apply file change"
     if "view_image" in haystack or tool in {"view_image", "image_view"}:
         return "Inspect image"
-    if any(marker in haystack for marker in ("pytest", "unittest", "run-unit-tests", "run-functional-tests", " tox ", " nox ")):
+    if any(
+        marker in haystack
+        for marker in ("pytest", "unittest", "run-unit-tests", "run-functional-tests", " tox ", " nox ")
+    ):
         return "Run tests"
     if "compileall" in haystack or " py_compile" in haystack:
         return "Check Python syntax"

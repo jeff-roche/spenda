@@ -11,17 +11,17 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 from ..config import Settings
 from ..db import database, initialize
 from .action_labels import prefer_action_label, safe_action_label
-
 
 PARSER_VERSION = 1
 SOURCE_APP = "opencode"
