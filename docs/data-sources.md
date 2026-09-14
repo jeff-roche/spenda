@@ -10,7 +10,7 @@ output, attachments, source code, credentials, or full conversations.
 
 Codex is discovered from `${CODEX_HOME:-~/.codex}` or `--codex-home`. The
 adapter reads the latest `state_*.sqlite` database and rollout JSONL files under
-`sessions/`, `archived_sessions/`, and compatible historical locations.
+`sessions/` and `archived_sessions/`.
 
 The state database supplies thread metadata, project and Git fields, agent
 attributes, and explicit parent-child relationships from `thread_spawn_edges`.

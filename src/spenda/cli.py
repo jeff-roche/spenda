@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
 
@@ -169,7 +170,9 @@ def doctor(settings: Settings) -> int:
     print(f"OpenCode database: {opencode_path}")
     if opencode_path.is_file():
         try:
-            with sqlite3.connect(f"{opencode_path.as_uri()}?mode=ro", uri=True, timeout=0.2) as source:
+            with closing(sqlite3.connect(
+                f"{opencode_path.as_uri()}?mode=ro", uri=True, timeout=0.2
+            )) as source:
                 source.execute("PRAGMA query_only=ON")
                 opencode_sessions = source.execute("SELECT COUNT(*) FROM session").fetchone()[0]
                 opencode_version = source.execute("SELECT MAX(version) FROM session").fetchone()[0]

@@ -51,7 +51,13 @@ To use a non-default history location, set the matching environment variable bef
 CODEX_HOME=~/.codex_private uv run spenda serve
 OPENCODE_DB=/path/to/opencode.db uv run spenda serve
 CLAUDE_CONFIG_DIR=/path/to/claude uv run spenda serve
+SPENDA_DB=/path/to/dashboard.sqlite uv run spenda serve
 ```
+
+The same dashboard database can be selected with `--database /path/to/dashboard.sqlite`.
+Spenda is designed as a local, single-user tool and has no authentication or CSRF
+protection. Keep the default loopback binding; if you use `--host` to expose it,
+put it behind a trusted authenticated reverse proxy and do not publish it directly.
 
 If you installed with pip, omit `uv run` from these commands.
 

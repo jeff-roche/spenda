@@ -256,7 +256,7 @@ def _read_transcript(
     assistant: dict[str, _AssistantRecord] = {}
     cost_states: list[_CostState] = []
     try:
-        lines = transcript.path.open(encoding="utf-8")
+        lines = transcript.path.open("rb")
     except OSError:
         summary.parser_warnings += 1
         return assistant, cost_states, False, False
@@ -265,7 +265,7 @@ def _read_transcript(
         for ordinal, line in enumerate(lines):
             try:
                 record = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 summary.malformed_lines += 1
                 complete = False
                 continue

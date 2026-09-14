@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from ..config import Settings
 from ..db import database, initialize
@@ -72,15 +73,19 @@ def discover_opencode_database(settings: Settings) -> Path:
     return (data_home / "opencode" / "opencode.db").expanduser().resolve()
 
 
-def _source_connection(path: Path) -> sqlite3.Connection:
+@contextmanager
+def _source_connection(path: Path) -> Iterator[sqlite3.Connection]:
     if not path.is_file():
         raise FileNotFoundError(f"OpenCode database not found: {path}")
     # as_uri quotes path characters correctly; mode=ro prevents SQLite from
     # creating a database if the source disappears between the stat and open.
     conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.2)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        yield conn
+    finally:
+        conn.close()
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -492,12 +497,12 @@ def ingest_opencode(settings: Settings, force_all: bool = False) -> OpenCodeInge
 
             # Roots own dashboard tasks.  Children are represented as agents
             # in their root task, preserving OpenCode's immediate parent link.
+            rows_by_id = {str(row["id"]): row for row in source_sessions}
             roots: dict[str, sqlite3.Row] = {}
             for row in source_sessions:
                 root_external_id, _ = root_info[str(row["id"])]
-                roots.setdefault(root_external_id, row if root_external_id == row["id"] else row)
-            for root_external_id, representative in roots.items():
-                root_row = next((r for r in source_sessions if r["id"] == root_external_id), representative)
+                roots.setdefault(root_external_id, rows_by_id.get(root_external_id, row))
+            for root_external_id, root_row in roots.items():
                 root_id = _ns(root_external_id)
                 _ensure_session(
                     target, session_columns, root_id=root_id, source_path=source_path,

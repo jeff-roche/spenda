@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from math import isfinite
 from typing import Any
 
 
@@ -31,7 +32,11 @@ class TokenUsage:
         numbers: dict[str, int] = {}
         for field in TOKEN_FIELDS:
             raw = value.get(field, 0)
-            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or isinstance(raw, float) and not isfinite(raw)
+            ):
                 raw = 0
             numbers[field] = max(0, int(raw))
         # Across observed Codex versions, occasional UI token_count records had

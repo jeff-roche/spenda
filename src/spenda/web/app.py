@@ -222,7 +222,7 @@ def _svg_trend(rows: list[Any], width: int = 900, height: int = 190) -> str:
         for i, value in enumerate(values)
     )
     labels = "".join(
-        f'<text x="{left + i * step:.1f}" y="{height - 8}" text-anchor="middle">{row[0][5:]}</text>'
+        f'<text x="{left + i * step:.1f}" y="{height - 8}" text-anchor="middle">{str(row[0] or "")[5:]}</text>'
         for i, row in enumerate(rows) if i in {0, len(rows) - 1} or len(rows) <= 8
     )
     return (
@@ -297,7 +297,8 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             usage_where, usage_params = _period_clause(period, source)
             daily = conn.execute(
                 f"SELECT date(timestamp,'localtime'),SUM(CAST(cost_usd AS REAL)) FROM usage u WHERE {usage_where} "
-                "GROUP BY date(timestamp,'localtime') ORDER BY date(timestamp,'localtime')",
+                "GROUP BY date(timestamp,'localtime') HAVING date(timestamp,'localtime') IS NOT NULL "
+                "ORDER BY date(timestamp,'localtime')",
                 usage_params,
             ).fetchall()
         return render(
@@ -411,6 +412,8 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
     def update_tags(session_id: str, tags: str = Form(""), source: str = "all"):
         names = sorted({part.strip() for part in tags.split(",") if part.strip()})
         with database(settings.database) as conn:
+            if not conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+                return HTMLResponse("Session not found", status_code=404)
             conn.execute("DELETE FROM session_tags WHERE session_id=?", (session_id,))
             for name in names:
                 conn.execute("INSERT OR IGNORE INTO tags(name) VALUES(?)", (name,))
@@ -433,7 +436,8 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             ).fetchall()
             daily = conn.execute(
                 f"""SELECT date(timestamp,'localtime'),model,SUM(CAST(cost_usd AS REAL)),SUM(cost_usd IS NULL)
-                   FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model ORDER BY 1,2""",
+                   FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model
+                   HAVING date(timestamp,'localtime') IS NOT NULL ORDER BY 1,2""",
                 source_params,
             ).fetchall()
         return render(
@@ -472,7 +476,8 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                    SUM(cost_usd IS NULL) unknown_cost_records,
                    100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
                    SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
-                   FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime') ORDER BY period""",
+                   FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime')
+                   HAVING period IS NOT NULL ORDER BY period""",
                 source_params,
             ).fetchall()
             weekly = conn.execute(
@@ -481,13 +486,15 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                    SUM(cost_usd IS NULL) unknown_cost_records,
                    100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
                    SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
-                   FROM usage u WHERE {source_where} GROUP BY strftime('%Y-W%W',timestamp,'localtime') ORDER BY period""",
+                   FROM usage u WHERE {source_where} GROUP BY strftime('%Y-W%W',timestamp,'localtime')
+                   HAVING period IS NOT NULL ORDER BY period""",
                 source_params,
             ).fetchall()
             by_model = conn.execute(
                 f"""SELECT date(timestamp,'localtime') period,model,SUM(CAST(cost_usd AS REAL)) cost,
                    SUM(total_tokens) tokens,SUM(cost_usd IS NULL) unknown_cost_records
-                   FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model ORDER BY period,model""",
+                   FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model
+                   HAVING period IS NOT NULL ORDER BY period,model""",
                 source_params,
             ).fetchall()
         return render(request, "trends.html", active="trends", source=source, daily=daily, weekly=weekly,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Iterator
 
@@ -204,11 +204,11 @@ def _migrate_session_source_columns(conn: sqlite3.Connection) -> None:
 
 def initialize(path: Path) -> None:
     if path.exists() and path.stat().st_size:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2) as existing:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)) as existing:
             tables = {row[0] for row in existing.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if tables and "dashboard_meta" not in tables:
             raise ValueError(f"refusing to modify a non-dashboard SQLite database: {path}")
-    with connect(path) as conn:
+    with closing(connect(path)) as conn, conn:
         # Upgrade before applying the complete schema, which includes an index
         # over ``source_app`` that does not exist in v3.
         _migrate_session_source_columns(conn)

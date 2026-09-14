@@ -199,6 +199,34 @@ def test_claude_derives_fixed_action_labels_without_persisting_content(tmp_path)
         assert private_value not in logical_dump
 
 
+def test_claude_skips_non_utf8_line_and_imports_surrounding_records(tmp_path):
+    home = tmp_path / "claude"
+    root = home / "projects" / "-work-repo" / "root.jsonl"
+    root.parent.mkdir(parents=True)
+    first = _assistant(
+        session="root", message_id="first", timestamp="2026-09-01T10:00:00Z",
+        input_tokens=1, output_tokens=1,
+    ).encode()
+    second = _assistant(
+        session="root", message_id="second", timestamp="2026-09-01T10:00:01Z",
+        input_tokens=2, output_tokens=2,
+    ).encode()
+    root.write_bytes(first + b"\n\xff\n" + second + b"\n")
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+
+    summary = ingest_claude(settings)
+
+    assert summary.malformed_lines == 1
+    with database(settings.database, readonly=True) as conn:
+        identities = {
+            row[0] for row in conn.execute(
+                "SELECT source_record_identity FROM usage "
+                "WHERE source_event_type='claude_assistant_message'"
+            )
+        }
+    assert identities == {"claude:root:root:first", "claude:root:root:second"}
+
+
 @pytest.mark.parametrize(
     ("cost_state", "note"),
     (

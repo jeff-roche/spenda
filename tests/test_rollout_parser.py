@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from spenda.ingestion.rollout import ParserContext, RolloutParser
 from conftest import atomic, session_meta, token_count, turn, usage_values
 
@@ -66,6 +68,19 @@ def test_subagent_file_owner_not_overwritten_by_copied_parent_meta():
 def test_unrecognized_event_is_ignored():
     result = RolloutParser().parse({"type": "future_event", "payload": {"schema": 99}}, "source")
     assert result.usage is None and result.ignored_type == "future_event"
+
+
+@pytest.mark.parametrize("invalid", [float("inf"), float("-inf"), float("nan")])
+def test_non_finite_json_token_values_are_normalized(invalid):
+    parser = RolloutParser(
+        ParserContext(owner_thread_id="root", turn_id="t", model="gpt-5.6-sol", provider="openai")
+    )
+    values = usage_values(input_tokens=invalid, cached=invalid, output=invalid, reasoning=invalid)
+
+    result = parser.parse(atomic("root", "t", "response", values=values), "source")
+
+    assert result.usage is not None
+    assert result.usage.usage.fingerprint() == (0, 0, 400, 0, 0, 0)
 
 
 def test_safe_call_labels_from_persisted_response_metadata():

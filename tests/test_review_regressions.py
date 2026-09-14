@@ -153,6 +153,57 @@ def test_unknown_cost_is_ignored_in_trend_totals(dashboard_settings):
     assert "+ unknown" not in body
 
 
+def test_invalid_usage_timestamp_does_not_break_date_based_pages(dashboard_settings):
+    _root(dashboard_settings)
+    ingest(dashboard_settings)
+    with database(dashboard_settings.database) as conn:
+        conn.execute("UPDATE usage SET timestamp='not-a-timestamp'")
+    app = create_app(dashboard_settings)
+
+    for path in ("/", "/models", "/trends"):
+        request = Request(
+            {"type": "http", "method": "GET", "path": path, "headers": [],
+             "query_string": b"", "app": app}
+        )
+        route = next(route.endpoint for route in app.routes if route.path == path)
+        kwargs = {"period": "all"} if path == "/" else {}
+        assert route(request, **kwargs).status_code == 200
+
+
+def test_codex_ingest_accepts_json_non_finite_token_values(dashboard_settings):
+    path = dashboard_settings.codex_home / "sessions" / "rollout-root.jsonl"
+    values = usage_values(
+        input_tokens=float("inf"), cached=float("nan"), write=0,
+        output=float("-inf"), reasoning=float("nan"),
+    )
+    write_rollout(path, [session_meta("root"), turn("t"), atomic("root", "t", "response", values=values)])
+    make_state(dashboard_settings.codex_home, [thread("root", path)])
+
+    summary = ingest(dashboard_settings)
+
+    assert summary.usage_records == 1
+    with database(dashboard_settings.database, readonly=True) as conn:
+        usage = conn.execute(
+            "SELECT input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens "
+            "FROM usage"
+        ).fetchone()
+    assert tuple(usage) == (0, 0, 0, 0, 0)
+
+
+def test_tagging_unknown_session_returns_404_without_creating_tag(dashboard_settings):
+    app = create_app(dashboard_settings)
+    route = next(
+        route.endpoint for route in app.routes
+        if route.path == "/sessions/{session_id}/tags" and "POST" in route.methods
+    )
+
+    response = route("missing", tags="unexpected", source="all")
+
+    assert response.status_code == 404
+    with database(dashboard_settings.database, readonly=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0] == 0
+
+
 def test_session_page_has_model_charts_and_readable_call_labels(dashboard_settings):
     _root(dashboard_settings)
     ingest(dashboard_settings)
