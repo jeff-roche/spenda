@@ -25,11 +25,15 @@ SOURCE_APP = "claude"
 _PREFIX = "claude:"
 _ASSISTANT_EVENT = "claude_assistant_message"
 _COST_EVENT = "claude_cost_state"
+# Bump when the values derived from a transcript change, so recorded
+# fingerprints from an older parser stop suppressing a reread.
+PARSER_VERSION = 1
 
 
 @dataclass(slots=True)
 class ClaudeIngestSummary:
     scanned_files: int = 0
+    unchanged_files: int = 0
     scanned_sessions: int = 0
     root_sessions: int = 0
     subagent_sessions: int = 0
@@ -89,6 +93,75 @@ class _CostState:
     timestamp: str | None
     ordinal: int
     source_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _Fingerprint:
+    """Cheap identity of a transcript's on-disk state; never its content."""
+
+    inode: int
+    size: int
+    mtime_ns: int
+
+
+def _fingerprint(path: Path) -> _Fingerprint | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return _Fingerprint(stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _stored_fingerprints(conn) -> dict[str, _Fingerprint]:
+    """Return fingerprints recorded after each transcript's last complete import."""
+
+    return {
+        row[0]: _Fingerprint(int(row[1] or 0), int(row[2]), int(row[3]))
+        for row in conn.execute(
+            "SELECT source_path,inode,size,mtime_ns FROM ingestion_state "
+            "WHERE source_key LIKE 'claude:%' AND parser_version=?",
+            (PARSER_VERSION,),
+        )
+    }
+
+
+def _store_fingerprints(conn, fingerprints: dict[str, _Fingerprint], scanned_at: str) -> None:
+    conn.executemany(
+        """INSERT INTO ingestion_state(source_key,source_path,inode,last_offset,mtime_ns,size,
+             parser_version,last_successful_ingestion)
+           VALUES(?,?,?,?,?,?,?,?)
+           ON CONFLICT(source_key) DO UPDATE SET
+             source_path=excluded.source_path,inode=excluded.inode,last_offset=excluded.last_offset,
+             mtime_ns=excluded.mtime_ns,size=excluded.size,parser_version=excluded.parser_version,
+             last_successful_ingestion=excluded.last_successful_ingestion""",
+        (
+            (_ns(path), path, item.inode, item.size, item.mtime_ns, item.size, PARSER_VERSION, scanned_at)
+            for path, item in fingerprints.items()
+        ),
+    )
+
+
+def _group_of(path: str, projects: Path) -> str | None:
+    """Return the root session a recorded transcript path belongs to, if any."""
+
+    try:
+        transcript = _transcript_for(Path(path), projects)
+    except ValueError:
+        # Recorded under a different Claude home; it can never match here.
+        return None
+    return transcript.root_external_id if transcript is not None else None
+
+
+def _prune_fingerprints(conn, current_paths: set[str]) -> None:
+    stored = {
+        row[0] for row in conn.execute(
+            "SELECT source_path FROM ingestion_state WHERE source_key LIKE 'claude:%'"
+        )
+    }
+    conn.executemany(
+        "DELETE FROM ingestion_state WHERE source_key=?",
+        ((_ns(path),) for path in stored - current_paths),
+    )
 
 
 def discover_claude_home(settings: Settings) -> Path:
@@ -487,13 +560,17 @@ def _upsert_cost(
 
 
 def _remove_stale_usage(
-    conn, *, event: str, scope: str, params: tuple[Any, ...], identities: set[str]
+    conn, *, event: str, scope: str, params: tuple[Any, ...], identities: set[str],
+    keep_files: frozenset[str] | set[str] = frozenset(),
 ) -> None:
+    # Rows from transcripts that were skipped as unchanged were not reread, so
+    # their identities are absent from ``identities`` and must be left alone.
     stored = {
         row[0] for row in conn.execute(
-            f"SELECT source_record_identity FROM usage WHERE source_event_type=? AND {scope}",
+            f"SELECT source_record_identity,source_file FROM usage WHERE source_event_type=? AND {scope}",
             (event, *params),
         )
+        if row[1] not in keep_files
     }
     conn.executemany(
         "DELETE FROM usage WHERE source_event_type=? AND source_record_identity=?",
@@ -517,16 +594,20 @@ def _reconcile_transcript_records(
         )
 
 
-def _reconcile(conn, *, transcript_ids: set[str], usage_ids: set[str]) -> None:
+def _reconcile(
+    conn, *, transcript_ids: set[str], usage_ids: set[str], keep_files: set[str]
+) -> None:
     _remove_stale_usage(
         conn, event=_ASSISTANT_EVENT,
         scope="source_record_identity LIKE 'claude:%'", params=(),
         identities={item for item in usage_ids if not item.startswith(_ns("cost:"))},
+        keep_files=keep_files,
     )
     _remove_stale_usage(
         conn, event=_COST_EVENT,
         scope="source_record_identity LIKE 'claude:%'", params=(),
         identities={item for item in usage_ids if item.startswith(_ns("cost:"))},
+        keep_files=keep_files,
     )
 
     stored_transcripts = {
@@ -581,9 +662,14 @@ def ingest_claude(
 ) -> ClaudeIngestSummary:
     """Ingest Claude Code transcript accounting without persisting content.
 
-    Full scans are deliberate: Claude Code can append later snapshots for the
-    same message ID.  Latest-record upserts give incremental behavior and make
-    deletion reconciliation reliable without retaining source content.
+    Claude Code can append later snapshots for the same message ID, so a
+    changed transcript is always reread completely and upserted by identity.
+    A root session and its subagent transcripts form one unit.  When every
+    transcript in a unit still matches the inode, size, and mtime recorded
+    after its last complete import, the unit is skipped without opening a
+    file; its rows are left untouched by reconciliation and only its liveness
+    status is recomputed from the stored activity timestamp.  ``force_all``
+    rereads everything.
     """
 
     settings.validate()
@@ -598,28 +684,68 @@ def ingest_claude(
     transcripts = [_transcript_for(path, projects) for path in paths]
     transcripts = [item for item in transcripts if item is not None]
     root_files = {item.root_external_id for item in transcripts if not item.is_subagent}
-    assistants: dict[str, _AssistantRecord] = {}
-    cost_states: dict[str, list[_CostState]] = {}
-    readable_transcripts: list[_Transcript] = []
-    complete_transcript_ids: set[str] = set()
-    scan_complete = discovery_complete
+    groups: dict[str, list[_Transcript]] = {}
     for transcript in transcripts:
-        rows, states, transcript_complete, readable = _read_transcript(transcript, summary)
-        scan_complete = scan_complete and transcript_complete
-        if not readable:
-            continue
-        readable_transcripts.append(transcript)
-        if transcript_complete:
-            complete_transcript_ids.add(transcript.thread_id)
-        assistants.update(rows)
-        if not transcript.is_subagent:
-            cost_states[transcript.root_external_id] = states
+        groups.setdefault(transcript.root_external_id, []).append(transcript)
+    # Fingerprints are taken before a transcript is read.  A write that lands
+    # between the stat and the read therefore still changes the fingerprint
+    # relative to what is recorded, and the transcript is reread next pass.
+    fingerprints = {str(item.path): _fingerprint(item.path) for item in transcripts}
 
     initialize(settings.database)
     scan_now = (now or datetime.now(UTC)).astimezone(UTC)
+    running_window = int(getattr(settings, "running_window_seconds", 0))
     with database(settings.database) as conn:
+        # Reading the recorded fingerprints does not open a write transaction,
+        # so the dashboard database stays unlocked while transcripts are read.
+        stored = {} if force_all else _stored_fingerprints(conn)
+        # A unit is unchanged only when its membership is unchanged too: a
+        # removed subagent transcript leaves the root file untouched but must
+        # still trigger a reread so coverage and reconciliation see the loss.
+        stored_members: dict[str, set[str]] = {}
+        for path in stored:
+            root = _group_of(path, projects)
+            if root is not None:
+                stored_members.setdefault(root, set()).add(path)
+        skipped_roots = {
+            root for root, items in groups.items()
+            if stored_members.get(root) == {str(item.path) for item in items}
+            and all(
+                fingerprints[str(item.path)] is not None
+                and stored[str(item.path)] == fingerprints[str(item.path)]
+                for item in items
+            )
+        }
+        skipped_files = {str(item.path) for root in skipped_roots for item in groups[root]}
+        summary.unchanged_files = len(skipped_files)
+
+        assistants: dict[str, _AssistantRecord] = {}
+        cost_states: dict[str, list[_CostState]] = {}
+        readable_transcripts: list[_Transcript] = []
+        complete_transcript_ids: set[str] = set()
+        # A unit is complete when the directory scan was complete and every one
+        # of its transcripts was read without error.  Only then do its derived
+        # coverage, liveness, and fingerprints describe the whole unit.
+        group_complete: dict[str, bool] = {}
+        for root, items in groups.items():
+            if root in skipped_roots:
+                continue
+            complete = discovery_complete
+            for transcript in items:
+                rows, states, transcript_complete, readable = _read_transcript(transcript, summary)
+                complete = complete and transcript_complete
+                if not readable:
+                    continue
+                readable_transcripts.append(transcript)
+                if transcript_complete:
+                    complete_transcript_ids.add(transcript.thread_id)
+                assistants.update(rows)
+                if not transcript.is_subagent:
+                    cost_states[root] = states
+            group_complete[root] = complete
+        scan_complete = discovery_complete and all(group_complete.values())
+
         current_transcript_ids = {item.thread_id for item in transcripts}
-        roots = {item.root_external_id for item in transcripts}
         readable_roots = {item.root_external_id for item in readable_transcripts}
         for root in readable_roots:
             root_item = next((
@@ -634,18 +760,24 @@ def ingest_claude(
         # A child can continue producing messages after the root has become
         # idle.  Liveness belongs to the task/session, so use the latest
         # envelope timestamp across every transcript associated with that root.
-        if scan_complete:
-            for root in roots:
-                latest = max(
-                    (item.updated_at for item in readable_transcripts if item.root_external_id == root and item.updated_at),
-                    default=None,
+        for root, items in groups.items():
+            root_id = _ns(root)
+            if root in skipped_roots:
+                # Nothing on disk changed, but the running window may have
+                # elapsed since the stored activity timestamp was written.
+                stored_row = conn.execute("SELECT updated_at FROM sessions WHERE id=?", (root_id,)).fetchone()
+                if stored_row is None:
+                    continue
+                status, finished_at = _session_liveness(stored_row[0], running_window, scan_now)
+                conn.execute(
+                    "UPDATE sessions SET status=?,finished_at=? WHERE id=?", (status, finished_at, root_id)
                 )
-                status, finished_at = _session_liveness(
-                    latest, int(getattr(settings, "running_window_seconds", 0)), scan_now
-                )
+            elif group_complete[root]:
+                latest = max((item.updated_at for item in items if item.updated_at), default=None)
+                status, finished_at = _session_liveness(latest, running_window, scan_now)
                 conn.execute(
                     "UPDATE sessions SET updated_at=?,status=?,finished_at=? WHERE id=?",
-                    (latest, status, finished_at, _ns(root)),
+                    (latest, status, finished_at, root_id),
                 )
         coverage: dict[str, tuple[bool, str]] = {}
         root_cost_coverage: dict[str, bool] = {}
@@ -713,8 +845,11 @@ def ingest_claude(
                     summary.usage_records += 1
                     summary.estimated_spend += float(cost)
         if scan_complete:
-            _reconcile(conn, transcript_ids=current_transcript_ids, usage_ids=current_usage_ids)
-            _refresh_coverage(conn, coverage)
+            _reconcile(
+                conn, transcript_ids=current_transcript_ids, usage_ids=current_usage_ids,
+                keep_files=skipped_files,
+            )
+            _prune_fingerprints(conn, set(fingerprints))
         else:
             # A failure elsewhere must not block safe replacement within a
             # transcript that was itself read completely.
@@ -729,6 +864,21 @@ def ingest_claude(
                     conn, transcript, transcript_assistant_ids,
                     cost_ids_by_root.get(transcript.root_external_id, set()),
                 )
+        # Coverage depends on every transcript of a unit, so it is written per
+        # complete unit rather than only when the whole scan was clean.
+        _refresh_coverage(conn, {
+            _ns(root): coverage[_ns(root)]
+            for root in readable_roots if group_complete[root] and _ns(root) in coverage
+        })
+        _store_fingerprints(
+            conn,
+            {
+                str(item.path): fingerprints[str(item.path)]
+                for root, complete in group_complete.items() if complete
+                for item in groups[root] if fingerprints[str(item.path)] is not None
+            },
+            scan_now.isoformat(),
+        )
         _refresh_turn_counts(conn)
         summary.scanned_sessions = len(transcripts)
         summary.root_sessions = int(conn.execute(

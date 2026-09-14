@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -84,6 +85,24 @@ def _fixture(home: Path, *, cost_state: str = "complete") -> tuple[Path, Path]:
     return root, child
 
 
+def _touch(path: Path) -> None:
+    """Advance mtime deterministically, independent of filesystem granularity."""
+
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+
+def _forbid_open(monkeypatch, *paths: Path) -> None:
+    original_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path in paths:
+            raise AssertionError(f"unchanged transcript was reopened: {path}")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(claude_module.Path, "open", guarded_open)
+
+
 def test_claude_ingestion_keeps_only_accounting_and_latest_message(tmp_path):
     home = tmp_path / "claude"
     root, child = _fixture(home)
@@ -142,7 +161,9 @@ def test_claude_ingestion_keeps_only_accounting_and_latest_message(tmp_path):
     assert before == after
 
     second = ingest_claude(settings)
-    assert (second.usage_records, second.duplicate_records) == (0, 3)
+    assert (second.usage_records, second.duplicate_records, second.unchanged_files) == (0, 0, 2)
+    forced = ingest_claude(settings, force_all=True)
+    assert (forced.usage_records, forced.duplicate_records, forced.unchanged_files) == (0, 3, 0)
 
 
 def test_claude_derives_fixed_action_labels_without_persisting_content(tmp_path):
@@ -343,6 +364,8 @@ def test_read_failure_skips_reconciliation_and_keeps_existing_claude_rows(tmp_pa
             raise OSError("simulated transcript read failure")
         return original_open(path, *args, **kwargs)
 
+    # An unchanged transcript is never opened, so mark it as modified first.
+    _touch(root)
     monkeypatch.setattr(claude_module.Path, "open", failed_open)
     summary = ingest_claude(settings)
     assert summary.parser_warnings == 1
@@ -557,3 +580,159 @@ def test_unreadable_project_does_not_erase_claude_history(tmp_path, monkeypatch)
         ).fetchone()[0]
     assert summary.parser_warnings == 1
     assert sessions == 1
+
+
+def test_unchanged_transcripts_are_skipped_until_a_file_changes(tmp_path, monkeypatch):
+    home = tmp_path / "claude"
+    root, child = _fixture(home)
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+
+    first = ingest_claude(settings)
+    assert (first.unchanged_files, first.usage_records) == (0, 3)
+
+    _forbid_open(monkeypatch, root, child)
+    second = ingest_claude(settings)
+    assert (second.scanned_files, second.unchanged_files) == (2, 2)
+    assert (second.usage_records, second.duplicate_records) == (0, 0)
+    with database(settings.database, readonly=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'").fetchone()[0] == 3
+        assert conn.execute("SELECT accounting_status FROM sessions WHERE id='claude:root'").fetchone()[0] == "partial"
+
+    # A change to any transcript in the unit rereads the whole unit.
+    monkeypatch.undo()
+    with child.open("a", encoding="utf-8") as handle:
+        handle.write(_assistant(
+            session="root", message_id="message-child-2", timestamp="2026-09-01T10:00:04Z",
+            input_tokens=8, output_tokens=9,
+        ) + "\n")
+    third = ingest_claude(settings)
+    assert (third.unchanged_files, third.usage_records, third.duplicate_records) == (0, 1, 3)
+    with database(settings.database, readonly=True) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source_record_identity='claude:root:agent-child:message-child-2'"
+        ).fetchone()[0] == 1
+        assert conn.execute("SELECT updated_at FROM sessions WHERE id='claude:root'").fetchone()[0] == "2026-09-01T10:00:04Z"
+
+    # A same-size rewrite still changes mtime, and force_all ignores fingerprints.
+    _touch(root)
+    assert ingest_claude(settings).unchanged_files == 0
+    assert ingest_claude(settings).unchanged_files == 2
+    assert ingest_claude(settings, force_all=True).unchanged_files == 0
+
+
+def test_reconciliation_leaves_skipped_unit_alone_while_changed_unit_is_replaced(tmp_path, monkeypatch):
+    home = tmp_path / "claude"
+    root, child = _fixture(home)
+    other = home / "projects" / "-work-repo" / "other.jsonl"
+    other.write_text(
+        _assistant(session="other", message_id="message-other", timestamp="2026-09-02T10:00:00Z", input_tokens=1, output_tokens=1) + "\n",
+        encoding="utf-8",
+    )
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+    ingest_claude(settings)
+
+    other.write_text(
+        _assistant(session="other", message_id="message-replaced", timestamp="2026-09-02T10:00:01Z", input_tokens=1, output_tokens=1) + "\n",
+        encoding="utf-8",
+    )
+    _touch(other)
+    _forbid_open(monkeypatch, root, child)
+    summary = ingest_claude(settings)
+
+    assert summary.unchanged_files == 2
+    with database(settings.database, readonly=True) as conn:
+        identities = sorted(row[0] for row in conn.execute(
+            "SELECT source_record_identity FROM usage WHERE source_record_identity LIKE 'claude:%'"
+        ))
+    assert identities == [
+        "claude:cost:root:3:claude-test",
+        "claude:other:root:message-replaced",
+        "claude:root:agent-child:message-child",
+        "claude:root:root:message-root",
+    ]
+
+
+def test_partial_unit_is_not_fingerprinted_and_is_reread(tmp_path, monkeypatch):
+    home = tmp_path / "claude"
+    root, child = _fixture(home)
+    child.write_text("{malformed\n", encoding="utf-8")
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+
+    assert ingest_claude(settings).malformed_lines == 1
+    assert ingest_claude(settings).unchanged_files == 0
+
+    child.write_text(
+        _assistant(session="root", message_id="message-child", timestamp="2026-09-01T10:00:03Z", input_tokens=6, output_tokens=7) + "\n",
+        encoding="utf-8",
+    )
+    assert ingest_claude(settings).malformed_lines == 0
+    assert ingest_claude(settings).unchanged_files == 2
+
+
+def test_removed_transcript_fingerprints_are_pruned_after_complete_scan(tmp_path):
+    home = tmp_path / "claude"
+    root, child = _fixture(home)
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+    ingest_claude(settings)
+    child.unlink()
+    child.parent.rmdir()
+    child.parent.parent.rmdir()
+
+    # The root file is untouched, but the unit lost a member and is reread so
+    # its coverage no longer cites subagent usage.
+    summary = ingest_claude(settings)
+
+    assert summary.unchanged_files == 0
+    with database(settings.database, readonly=True) as conn:
+        stored = [row[0] for row in conn.execute(
+            "SELECT source_path FROM ingestion_state WHERE source_key LIKE 'claude:%' ORDER BY 1"
+        )]
+        assert conn.execute("SELECT COUNT(*) FROM agents WHERE source_kind='claude'").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'").fetchone()[0] == 2
+        assert conn.execute("SELECT accounting_status FROM sessions WHERE id='claude:root'").fetchone()[0] == "complete"
+    assert stored == [str(root)]
+    assert ingest_claude(settings).unchanged_files == 1
+
+
+def test_unchanged_history_pass_opens_no_transcript_files(tmp_path, monkeypatch):
+    home = tmp_path / "claude"
+    project = home / "projects" / "-work-repo"
+    project.mkdir(parents=True)
+    for index in range(20):
+        session = f"session-{index}"
+        (project / f"{session}.jsonl").write_text(
+            _assistant(session=session, message_id="m", timestamp="2026-09-01T10:00:00Z", input_tokens=1, output_tokens=1) + "\n",
+            encoding="utf-8",
+        )
+        child = project / session / "subagents" / f"agent-{index}.jsonl"
+        child.parent.mkdir(parents=True)
+        child.write_text(
+            _assistant(session=session, message_id="c", timestamp="2026-09-01T10:00:01Z", input_tokens=1, output_tokens=1) + "\n",
+            encoding="utf-8",
+        )
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+    opened: list[Path] = []
+    original_open = Path.open
+
+    def counting_open(path, *args, **kwargs):
+        if path.suffix == ".jsonl":
+            opened.append(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(claude_module.Path, "open", counting_open)
+
+    first = ingest_claude(settings)
+    assert (first.scanned_files, first.unchanged_files, len(opened)) == (40, 0, 40)
+
+    opened.clear()
+    second = ingest_claude(settings)
+    assert (second.scanned_files, second.unchanged_files, len(opened)) == (40, 40, 0)
+    with database(settings.database, readonly=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'").fetchone()[0] == 40
+        assert conn.execute("SELECT COUNT(*) FROM sessions WHERE source_app='claude'").fetchone()[0] == 20
+
+    # Touching one root rereads exactly that unit: its root and its subagent.
+    opened.clear()
+    _touch(project / "session-7.jsonl")
+    third = ingest_claude(settings)
+    assert (third.unchanged_files, sorted(p.name for p in opened)) == (38, ["agent-7.jsonl", "session-7.jsonl"])

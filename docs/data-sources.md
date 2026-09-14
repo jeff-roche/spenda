@@ -84,6 +84,15 @@ line or transcript has an error. Destructive reconciliation is limited to
 complete, readable scope: a fully read transcript can reconcile its own rows,
 and removal of missing transcripts requires a complete directory scan.
 
+A root transcript and its subagent transcripts are one unit. After a unit is
+read completely, the inode, size, and mtime of each of its files are recorded
+in the dashboard's `ingestion_state` table. On later passes a unit whose
+membership and fingerprints are all unchanged is skipped without opening any
+file; its rows are left alone by reconciliation and only its running or
+completed status is recomputed from the stored activity timestamp. A change to
+any file, a new or removed subagent transcript, or `spenda ingest --all`
+rereads the whole unit.
+
 ## Accounting and source changes
 
 See [accounting.md](accounting.md) for normalization and pricing formulas.
