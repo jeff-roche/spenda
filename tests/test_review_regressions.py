@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from starlette.requests import Request
 
+import spenda.web.app as web_module
+from conftest import atomic, make_state, session_meta, thread, turn, usage_values, write_rollout
 from spenda.cli import rebuild, tag_command
 from spenda.config import Settings
 from spenda.db import database, initialize
@@ -15,8 +17,6 @@ from spenda.ingestion.scanner import ingest
 from spenda.pricing import add_price, reprice_usage
 from spenda.reports import session_rows
 from spenda.web.app import SESSION_SORT_KEYS, _model_style, _period_boundary, create_app
-import spenda.web.app as web_module
-from conftest import atomic, make_state, session_meta, thread, turn, usage_values, write_rollout
 
 
 def _root(settings: Settings, *, model: str = "gpt-5.6-sol"):
@@ -116,7 +116,7 @@ def test_missing_rollout_marks_accounting_unavailable(dashboard_settings):
 
 
 def test_period_boundary_uses_exact_utc_instant():
-    now = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
     boundary = _period_boundary("7d", now)
     with sqlite3.connect(":memory:") as conn:
         included = conn.execute(
@@ -291,7 +291,11 @@ def test_task_sorting_uses_raw_numeric_values_for_every_column(dashboard_setting
         )
         write_rollout(
             path,
-            [session_meta(ident), turn(f"turn-{ident}"), atomic(ident, f"turn-{ident}", f"response-{ident}", values=values)],
+            [
+                session_meta(ident),
+                turn(f"turn-{ident}"),
+                atomic(ident, f"turn-{ident}", f"response-{ident}", values=values),
+            ],
         )
         state_row = thread(ident, path)
         state_row["title"] = title

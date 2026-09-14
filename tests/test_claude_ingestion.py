@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
+import spenda.ingestion.claude as claude_module
 from spenda.db import database
 from spenda.ingestion.claude import discover_claude_home, ingest_claude
-import spenda.ingestion.claude as claude_module
 from spenda.pricing import reprice_usage
 from spenda.reports import session_detail
 
@@ -62,10 +62,16 @@ def _fixture(home: Path, *, cost_state: str = "complete") -> tuple[Path, Path]:
     child.parent.mkdir(parents=True)
     root.parent.mkdir(parents=True, exist_ok=True)
     records = [
-            _assistant(session="root", message_id="message-root", timestamp="2026-09-01T10:00:00Z", input_tokens=1, output_tokens=1, git_branch="main", effort="high"),
+            _assistant(
+                session="root", message_id="message-root", timestamp="2026-09-01T10:00:00Z",
+                input_tokens=1, output_tokens=1, git_branch="main", effort="high",
+            ),
             # Streaming snapshots reuse the same message ID.  The final row is
             # the only accounting record that should remain.
-            _assistant(session="root", message_id="message-root", timestamp="2026-09-01T10:00:01Z", input_tokens=4, output_tokens=5, git_branch="main", effort="high"),
+            _assistant(
+                session="root", message_id="message-root", timestamp="2026-09-01T10:00:01Z",
+                input_tokens=4, output_tokens=5, git_branch="main", effort="high",
+            ),
             _line(kind="ai-title", session="root", timestamp="2026-09-01T10:00:01Z", aiTitle="Generated safe title"),
     ]
     if cost_state != "missing":
@@ -79,7 +85,10 @@ def _fixture(home: Path, *, cost_state: str = "complete") -> tuple[Path, Path]:
         )
     root.write_text("\n".join(records) + "\n", encoding="utf-8")
     child.write_text(
-        _assistant(session="root", message_id="message-child", timestamp="2026-09-01T10:00:03Z", input_tokens=6, output_tokens=7, effort="low") + "\n",
+        _assistant(
+            session="root", message_id="message-child", timestamp="2026-09-01T10:00:03Z",
+            input_tokens=6, output_tokens=7, effort="low",
+        ) + "\n",
         encoding="utf-8",
     )
     return root, child
@@ -125,7 +134,8 @@ def test_claude_ingestion_keeps_only_accounting_and_latest_message(tmp_path):
             "SELECT cost_usd,total_tokens,timestamp,source_file FROM usage WHERE source_event_type='claude_cost_state'"
         ).fetchone()
         session = conn.execute(
-            "SELECT turn_count,first_user_message_preview,source_app,source_version,git_branch,root_reasoning_effort FROM sessions"
+            "SELECT turn_count,first_user_message_preview,source_app,source_version,git_branch,root_reasoning_effort "
+            "FROM sessions"
         ).fetchone()
         detail = session_detail(conn, "claude:root")
         cost_label = conn.execute(
@@ -152,11 +162,13 @@ def test_claude_ingestion_keeps_only_accounting_and_latest_message(tmp_path):
 
     with database(settings.database) as conn:
         before = conn.execute(
-            "SELECT source_event_type,cost_usd,pricing_note FROM usage WHERE source_event_type GLOB 'claude_*' ORDER BY id"
+            "SELECT source_event_type,cost_usd,pricing_note "
+            "FROM usage WHERE source_event_type GLOB 'claude_*' ORDER BY id"
         ).fetchall()
         assert reprice_usage(conn, provider="anthropic") == 0
         after = conn.execute(
-            "SELECT source_event_type,cost_usd,pricing_note FROM usage WHERE source_event_type GLOB 'claude_*' ORDER BY id"
+            "SELECT source_event_type,cost_usd,pricing_note "
+            "FROM usage WHERE source_event_type GLOB 'claude_*' ORDER BY id"
         ).fetchall()
     assert before == after
 
@@ -294,7 +306,9 @@ def test_claude_reconciles_removed_subagent_and_preserves_codex(tmp_path):
     assert (summary.root_sessions, summary.subagent_sessions) == (1, 0)
     with database(settings.database, readonly=True) as conn:
         assert conn.execute("SELECT COUNT(*) FROM agents WHERE source_kind='claude'").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_event_type='claude_assistant_message'").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source_event_type='claude_assistant_message'"
+        ).fetchone()[0] == 1
         assert conn.execute("SELECT turn_count FROM sessions WHERE id='claude:root'").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM sessions WHERE id='codex:kept'").fetchone()[0] == 1
 
@@ -332,14 +346,18 @@ def test_missing_projects_preserves_claude_rows_but_readable_empty_projects_reco
     assert unavailable.parser_warnings == 1
     with database(settings.database, readonly=True) as conn:
         assert conn.execute("SELECT COUNT(*) FROM sessions WHERE source_app='claude'").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'").fetchone()[0] == 3
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'"
+        ).fetchone()[0] == 3
 
     projects.mkdir()
     empty = ingest_claude(settings)
     assert empty.parser_warnings == 0
     with database(settings.database, readonly=True) as conn:
         assert conn.execute("SELECT COUNT(*) FROM sessions WHERE source_app='claude'").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'"
+        ).fetchone()[0] == 0
 
 
 def test_read_failure_skips_reconciliation_and_keeps_existing_claude_rows(tmp_path, monkeypatch):
@@ -370,7 +388,9 @@ def test_read_failure_skips_reconciliation_and_keeps_existing_claude_rows(tmp_pa
     summary = ingest_claude(settings)
     assert summary.parser_warnings == 1
     with database(settings.database, readonly=True) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'").fetchone()[0] == 3
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'"
+        ).fetchone()[0] == 3
         assert conn.execute(
             "SELECT COUNT(*) FROM usage WHERE source_record_identity='claude:root:root:message-root'"
         ).fetchone()[0] == 1
@@ -595,7 +615,9 @@ def test_unchanged_transcripts_are_skipped_until_a_file_changes(tmp_path, monkey
     assert (second.scanned_files, second.unchanged_files) == (2, 2)
     assert (second.usage_records, second.duplicate_records) == (0, 0)
     with database(settings.database, readonly=True) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'").fetchone()[0] == 3
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'"
+        ).fetchone()[0] == 3
         assert conn.execute("SELECT accounting_status FROM sessions WHERE id='claude:root'").fetchone()[0] == "partial"
 
     # A change to any transcript in the unit rereads the whole unit.
@@ -611,7 +633,9 @@ def test_unchanged_transcripts_are_skipped_until_a_file_changes(tmp_path, monkey
         assert conn.execute(
             "SELECT COUNT(*) FROM usage WHERE source_record_identity='claude:root:agent-child:message-child-2'"
         ).fetchone()[0] == 1
-        assert conn.execute("SELECT updated_at FROM sessions WHERE id='claude:root'").fetchone()[0] == "2026-09-01T10:00:04Z"
+        assert conn.execute(
+            "SELECT updated_at FROM sessions WHERE id='claude:root'"
+        ).fetchone()[0] == "2026-09-01T10:00:04Z"
 
     # A same-size rewrite still changes mtime, and force_all ignores fingerprints.
     _touch(root)
@@ -625,14 +649,20 @@ def test_reconciliation_leaves_skipped_unit_alone_while_changed_unit_is_replaced
     root, child = _fixture(home)
     other = home / "projects" / "-work-repo" / "other.jsonl"
     other.write_text(
-        _assistant(session="other", message_id="message-other", timestamp="2026-09-02T10:00:00Z", input_tokens=1, output_tokens=1) + "\n",
+        _assistant(
+            session="other", message_id="message-other", timestamp="2026-09-02T10:00:00Z",
+            input_tokens=1, output_tokens=1,
+        ) + "\n",
         encoding="utf-8",
     )
     settings = _Settings(tmp_path / "dashboard.sqlite", home)
     ingest_claude(settings)
 
     other.write_text(
-        _assistant(session="other", message_id="message-replaced", timestamp="2026-09-02T10:00:01Z", input_tokens=1, output_tokens=1) + "\n",
+        _assistant(
+            session="other", message_id="message-replaced", timestamp="2026-09-02T10:00:01Z",
+            input_tokens=1, output_tokens=1,
+        ) + "\n",
         encoding="utf-8",
     )
     _touch(other)
@@ -662,7 +692,10 @@ def test_partial_unit_is_not_fingerprinted_and_is_reread(tmp_path, monkeypatch):
     assert ingest_claude(settings).unchanged_files == 0
 
     child.write_text(
-        _assistant(session="root", message_id="message-child", timestamp="2026-09-01T10:00:03Z", input_tokens=6, output_tokens=7) + "\n",
+        _assistant(
+            session="root", message_id="message-child", timestamp="2026-09-01T10:00:03Z",
+            input_tokens=6, output_tokens=7,
+        ) + "\n",
         encoding="utf-8",
     )
     assert ingest_claude(settings).malformed_lines == 0
@@ -688,7 +721,9 @@ def test_removed_transcript_fingerprints_are_pruned_after_complete_scan(tmp_path
             "SELECT source_path FROM ingestion_state WHERE source_key LIKE 'claude:%' ORDER BY 1"
         )]
         assert conn.execute("SELECT COUNT(*) FROM agents WHERE source_kind='claude'").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'").fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'"
+        ).fetchone()[0] == 2
         assert conn.execute("SELECT accounting_status FROM sessions WHERE id='claude:root'").fetchone()[0] == "complete"
     assert stored == [str(root)]
     assert ingest_claude(settings).unchanged_files == 1
@@ -701,13 +736,19 @@ def test_unchanged_history_pass_opens_no_transcript_files(tmp_path, monkeypatch)
     for index in range(20):
         session = f"session-{index}"
         (project / f"{session}.jsonl").write_text(
-            _assistant(session=session, message_id="m", timestamp="2026-09-01T10:00:00Z", input_tokens=1, output_tokens=1) + "\n",
+            _assistant(
+                session=session, message_id="m", timestamp="2026-09-01T10:00:00Z",
+                input_tokens=1, output_tokens=1,
+            ) + "\n",
             encoding="utf-8",
         )
         child = project / session / "subagents" / f"agent-{index}.jsonl"
         child.parent.mkdir(parents=True)
         child.write_text(
-            _assistant(session=session, message_id="c", timestamp="2026-09-01T10:00:01Z", input_tokens=1, output_tokens=1) + "\n",
+            _assistant(
+                session=session, message_id="c", timestamp="2026-09-01T10:00:01Z",
+                input_tokens=1, output_tokens=1,
+            ) + "\n",
             encoding="utf-8",
         )
     settings = _Settings(tmp_path / "dashboard.sqlite", home)
@@ -728,7 +769,9 @@ def test_unchanged_history_pass_opens_no_transcript_files(tmp_path, monkeypatch)
     second = ingest_claude(settings)
     assert (second.scanned_files, second.unchanged_files, len(opened)) == (40, 40, 0)
     with database(settings.database, readonly=True) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'").fetchone()[0] == 40
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'claude:%'"
+        ).fetchone()[0] == 40
         assert conn.execute("SELECT COUNT(*) FROM sessions WHERE source_app='claude'").fetchone()[0] == 20
 
     # Touching one root rereads exactly that unit: its root and its subagent.

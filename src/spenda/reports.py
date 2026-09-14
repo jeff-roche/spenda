@@ -4,7 +4,6 @@ import sqlite3
 from datetime import datetime
 from typing import Any
 
-
 SESSION_AGGREGATE = """
 WITH agent_agg AS (
   SELECT session_id,COUNT(*) agent_count FROM agents GROUP BY session_id
@@ -33,7 +32,8 @@ SELECT s.*,
        COALESCE(u.reasoning_tokens,0) AS reasoning_tokens,
        COALESCE(u.total_tokens,0) AS total_tokens,
        u.known_cost_usd,
-       COALESCE(u.unknown_cost_records,0) + CASE WHEN s.accounting_status!='complete' THEN 1 ELSE 0 END AS unknown_cost_records,
+       COALESCE(u.unknown_cost_records,0)
+         + CASE WHEN s.accounting_status!='complete' THEN 1 ELSE 0 END AS unknown_cost_records,
        COALESCE(u.usage_events,0) AS usage_events,
        CAST(strftime('%s',s.updated_at)-strftime('%s',s.created_at) AS INTEGER) AS duration_seconds,
        t.tags

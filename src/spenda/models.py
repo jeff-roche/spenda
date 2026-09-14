@@ -5,7 +5,6 @@ from decimal import Decimal
 from math import isfinite
 from typing import Any
 
-
 TOKEN_FIELDS = (
     "input_tokens",
     "cached_input_tokens",
@@ -26,7 +25,7 @@ class TokenUsage:
     total_tokens: int = 0
 
     @classmethod
-    def from_mapping(cls, value: dict[str, Any] | None) -> "TokenUsage | None":
+    def from_mapping(cls, value: dict[str, Any] | None) -> TokenUsage | None:
         if not isinstance(value, dict):
             return None
         numbers: dict[str, int] = {}
@@ -53,7 +52,7 @@ class TokenUsage:
     def fingerprint(self) -> tuple[int, ...]:
         return tuple(getattr(self, field) for field in TOKEN_FIELDS)
 
-    def delta_from(self, previous: "TokenUsage") -> tuple["TokenUsage", bool]:
+    def delta_from(self, previous: TokenUsage) -> tuple[TokenUsage, bool]:
         reset = any(getattr(self, f) < getattr(previous, f) for f in TOKEN_FIELDS)
         if reset:
             return self, True

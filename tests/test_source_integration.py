@@ -5,14 +5,14 @@ import sqlite3
 
 from starlette.requests import Request
 
+from conftest import atomic, make_state, session_meta, thread, turn, write_rollout
 from spenda.cli import export_command
 from spenda.config import Settings
 from spenda.db import database
 from spenda.ingestion.service import ingest_all
 from spenda.web.app import create_app
-from conftest import atomic, make_state, session_meta, thread, turn, write_rollout
-from test_opencode_ingestion import _source_db
 from test_claude_ingestion import _fixture
+from test_opencode_ingestion import _source_db
 
 
 def _combined_settings(tmp_path):
@@ -37,7 +37,8 @@ def _combined_settings(tmp_path):
         conn.execute("UPDATE project SET name='Synthetic OpenCode project'")
         conn.execute("UPDATE session SET title='Synthetic OpenCode task' WHERE id='root'")
         conn.execute(
-            "UPDATE session SET model=? WHERE id='root'", (json.dumps({"id": "opencode-model", "providerID": "provider"}),)
+            "UPDATE session SET model=? WHERE id='root'",
+            (json.dumps({"id": "opencode-model", "providerID": "provider"}),),
         )
         conn.execute(
             "UPDATE message SET data=json_set(data, '$.modelID', 'opencode-model')"
@@ -122,7 +123,9 @@ def test_combined_sources_are_available_in_every_source_filtered_report(tmp_path
         opencode_body = _page(app, path, "opencode")
         claude_body = _page(app, path, "claude")
         assert codex_value in codex_body and opencode_value not in codex_body and claude_value not in codex_body
-        assert opencode_value in opencode_body and codex_value not in opencode_body and claude_value not in opencode_body
+        assert (
+            opencode_value in opencode_body and codex_value not in opencode_body and claude_value not in opencode_body
+        )
         assert claude_value in claude_body and codex_value not in claude_body and opencode_value not in claude_body
 
     compare = next(route.endpoint for route in app.routes if route.path == "/compare")
@@ -147,13 +150,13 @@ def test_cli_export_filters_combined_sources(tmp_path, capsys):
     assert export_command(settings, "json", "sessions", "-", source="opencode") == 0
     exported = json.loads(capsys.readouterr().out)
 
-    assert [(row["session_id"], row["source_app"] ) for row in exported] == [
+    assert [(row["session_id"], row["source_app"]) for row in exported] == [
         ("opencode:root", "opencode")
     ]
 
     assert export_command(settings, "json", "sessions", "-", source="claude") == 0
     exported = json.loads(capsys.readouterr().out)
-    assert [(row["session_id"], row["source_app"] ) for row in exported] == [
+    assert [(row["session_id"], row["source_app"]) for row in exported] == [
         ("claude:session", "claude")
     ]
 

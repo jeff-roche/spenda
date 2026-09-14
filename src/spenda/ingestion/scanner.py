@@ -4,7 +4,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -92,7 +92,9 @@ def _sync_state(
         root_row = by_id.get(root, row if root == row["id"] else {})
         repo_root, repo_name = _repo_from_cwd(root_row.get("cwd"))
         title = _first_line(root_row.get("name") or root_row.get("title") or root_row.get("first_user_message"), 200)
-        preview = _first_line(root_row.get("first_user_message"), settings.preview_chars) if settings.keep_preview else None
+        preview = (
+            _first_line(root_row.get("first_user_message"), settings.preview_chars) if settings.keep_preview else None
+        )
         conn.execute(
             """UPDATE sessions SET
                title=COALESCE(?,title), first_user_message_preview=COALESCE(?,first_user_message_preview),
@@ -127,10 +129,10 @@ def _sync_state(
             _warn(
                 conn,
                 Path(rollout_path).name if rollout_path else row["id"],
-            -1,
-            "missing_rollout",
-            "state thread references no readable rollout; accounting is incomplete",
-            emit_log=False,
+                -1,
+                "missing_rollout",
+                "state thread references no readable rollout; accounting is incomplete",
+                emit_log=False,
             )
         conn.execute(
             """INSERT INTO agents(thread_id,session_id,parent_thread_id,agent_role,agent_nickname,
@@ -193,7 +195,7 @@ def _warn(
     conn.execute(
         "INSERT OR IGNORE INTO parser_warnings(source_key,source_ordinal,timestamp,code,message) "
         "VALUES(?,?,?,?,?)",
-        (source_key, -1 if ordinal is None else ordinal, datetime.now(timezone.utc).isoformat(), code, message[:500]),
+        (source_key, -1 if ordinal is None else ordinal, datetime.now(UTC).isoformat(), code, message[:500]),
     )
     if emit_log:
         log.warning("%s (%s): %s", code, source_key, message)
@@ -358,7 +360,9 @@ def _scan_file(
     parser_changed = state is not None and state["parser_version"] != PARSER_VERSION
     start = 0 if force_all or state is None or parser_changed else state["last_offset"]
     if state is not None and (before.st_size < start or (state["inode"] and state["inode"] != before.st_ino)):
-        _warn(conn, source_key, None, "source_reset", "source inode changed or file shrank; rescanning with deduplication")
+        _warn(
+            conn, source_key, None, "source_reset", "source inode changed or file shrank; rescanning with deduplication"
+        )
         summary.parser_warnings += 1
         start = 0
         state = None
@@ -456,7 +460,7 @@ def _scan_file(
            pending_call_label=excluded.pending_call_label,pending_call_priority=excluded.pending_call_priority""",
         (
             source_key, str(path), before.st_ino, end_offset, before.st_mtime_ns, before.st_size,
-            PARSER_VERSION, datetime.now(timezone.utc).isoformat(), parser.context.owner_thread_id,
+            PARSER_VERSION, datetime.now(UTC).isoformat(), parser.context.owner_thread_id,
             parser.context.turn_id, parser.context.model, parser.context.reasoning_effort,
             parser.context.provider, previous_json, recent_json,
             parser.context.pending_call_label, parser.context.pending_call_priority,
@@ -465,7 +469,7 @@ def _scan_file(
 
 
 def _refresh_sessions(conn: sqlite3.Connection, settings: Settings) -> None:
-    now = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(UTC).timestamp()
     rows = conn.execute(
         "SELECT id,updated_at FROM sessions WHERE source_app='codex'"
     ).fetchall()
@@ -478,7 +482,8 @@ def _refresh_sessions(conn: sqlite3.Connection, settings: Settings) -> None:
         running = False
         if updated:
             try:
-                running = now - datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp() <= settings.running_window_seconds
+                updated_ts = datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp()
+                running = now - updated_ts <= settings.running_window_seconds
             except ValueError:
                 pass
         coverage = conn.execute(
@@ -490,7 +495,10 @@ def _refresh_sessions(conn: sqlite3.Connection, settings: Settings) -> None:
         missing = int(coverage[1] or 0)
         if missing:
             accounting_status = "partial" if latest[0] else "unavailable"
-            accounting_note = f"{missing} source rollout(s) unavailable; {int(coverage[2] or 0)} state tokens lack detailed accounting"
+            accounting_note = (
+                f"{missing} source rollout(s) unavailable; "
+                f"{int(coverage[2] or 0)} state tokens lack detailed accounting"
+            )
         else:
             accounting_status, accounting_note = "complete", None
         conn.execute(

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from spenda.ingestion.rollout import ParserContext, RolloutParser
 from conftest import atomic, session_meta, token_count, turn, usage_values
+from spenda.ingestion.rollout import ParserContext, RolloutParser
 
 
 def test_atomic_and_duplicate_ui_event():
@@ -34,9 +34,11 @@ def test_repeated_legacy_snapshot_is_not_counted_twice():
 
 def test_cumulative_snapshots_and_reset():
     parser = RolloutParser(ParserContext(owner_thread_id="root", turn_id="t", model="gpt-5.6-sol", provider="openai"))
+
     def cumulative(value, ordinal):
+        totals = usage_values(input_tokens=value, cached=0, write=0, output=0, reasoning=0)
         return {"timestamp": f"2026-09-08T10:00:0{ordinal}Z", "type": "event_msg", "ordinal": ordinal,
-                "payload": {"type": "token_count", "info": {"total_token_usage": usage_values(input_tokens=value, cached=0, write=0, output=0, reasoning=0)}}}
+                "payload": {"type": "token_count", "info": {"total_token_usage": totals}}}
     first = parser.parse(cumulative(100, 1), "source")
     second = parser.parse(cumulative(140, 2), "source")
     reset = parser.parse(cumulative(20, 3), "source")

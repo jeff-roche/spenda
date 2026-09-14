@@ -182,7 +182,9 @@ def test_opencode_reconciles_removed_rows_without_touching_other_source(tmp_path
     assert (summary.root_sessions, summary.subagent_sessions) == (1, 0)
     with database(settings.database, readonly=True) as conn:
         assert conn.execute("SELECT COUNT(*) FROM agents WHERE thread_id LIKE 'opencode:%'").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'opencode:%'").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source_record_identity LIKE 'opencode:%'"
+        ).fetchone()[0] == 1
         assert conn.execute("SELECT turn_count FROM sessions WHERE id='opencode:root'").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM sessions WHERE id='codex:kept'").fetchone()[0] == 1
 

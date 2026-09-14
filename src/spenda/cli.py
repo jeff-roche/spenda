@@ -218,7 +218,10 @@ def sessions_command(settings: Settings, limit: int, sort: str, source: str = "a
     with database(settings.database, readonly=True) as conn:
         where, params = (("1=1", ()) if source == "all" else ("s.source_app=?", (source,)))
         rows = session_rows(conn, where=where, params=params, order=sort, limit=limit)
-    print(f"{'Started':16}  {'Source':8} {'Task':38}  {'Project':20}  {'Models':24} {'Agents':>6} {'Tokens':>10} {'Cost':>16}")
+    print(
+        f"{'Started':16}  {'Source':8} {'Task':38}  {'Project':20}  "
+        f"{'Models':24} {'Agents':>6} {'Tokens':>10} {'Cost':>16}"
+    )
     for row in rows:
         title = (row["title"] or "(untitled)")[:38]
         project = (row["repo_name"] or row["cwd"] or "unknown")[-20:]
@@ -226,7 +229,7 @@ def sessions_command(settings: Settings, limit: int, sort: str, source: str = "a
         print(
             f"{iso_date(row['created_at']):16}  {row['source_app']:8} {title:38}  {project:20}  {models:24} "
             f"{row['agent_count']:6d} {format_tokens(row['total_tokens']):>10} "
-            f"{format_cost(row['known_cost_usd'],row['unknown_cost_records']):>16}"
+            f"{format_cost(row['known_cost_usd'], row['unknown_cost_records']):>16}"
         )
     return 0
 
@@ -425,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
     if args.command == "serve":
         import uvicorn
+
         from .web.app import create_app
         uvicorn.run(create_app(settings, ingest_interval=args.interval), host=args.host, port=args.port)
         return 0

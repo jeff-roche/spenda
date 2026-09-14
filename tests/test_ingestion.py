@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from spenda.db import database
-from spenda.config import Settings
-from spenda.ingestion.scanner import ingest
 from conftest import atomic, make_state, session_meta, thread, token_count, turn, usage_values, write_rollout
+from spenda.config import Settings
+from spenda.db import database
+from spenda.ingestion.scanner import ingest
 
 
 def setup_root(settings, records=None):
@@ -48,8 +48,14 @@ def test_root_and_subagent_multiple_models(dashboard_settings):
     root_file, child_file = directory / "rollout-root.jsonl", directory / "rollout-child.jsonl"
     source = {"subagent": {"thread_spawn": {"parent_thread_id": "root", "depth": 1, "agent_path": "/root/explorer"}}}
     write_rollout(root_file, [session_meta("root"), turn("rt", "gpt-5.6-sol"), atomic("root", "rt", "root-resp")])
-    write_rollout(child_file, [session_meta("child", source), session_meta("root", ordinal=1), turn("ct", "gpt-5.6-luna", 2), atomic("child", "ct", "child-resp", ordinal=3)])
-    make_state(dashboard_settings.codex_home, [thread("root", root_file, agent_path="/root"), thread("child", child_file, source=source, model="gpt-5.6-luna", agent_path="/root/explorer")], [("root", "child")])
+    write_rollout(child_file, [session_meta("child", source), session_meta("root", ordinal=1),
+                               turn("ct", "gpt-5.6-luna", 2), atomic("child", "ct", "child-resp", ordinal=3)])
+    make_state(
+        dashboard_settings.codex_home,
+        [thread("root", root_file, agent_path="/root"),
+         thread("child", child_file, source=source, model="gpt-5.6-luna", agent_path="/root/explorer")],
+        [("root", "child")],
+    )
     summary = ingest(dashboard_settings)
     with database(dashboard_settings.database, readonly=True) as conn:
         sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
@@ -62,12 +68,18 @@ def test_root_and_subagent_multiple_models(dashboard_settings):
 def test_nested_subagents_resolve_to_original_root(dashboard_settings):
     directory = dashboard_settings.codex_home / "sessions" / "2026" / "09" / "08"
     rows, edges = [], []
-    for ident, parent, path in (("root", None, "/root"), ("child", "root", "/root/worker"), ("grand", "child", "/root/worker/reviewer")):
+    agents = (("root", None, "/root"), ("child", "root", "/root/worker"), ("grand", "child", "/root/worker/reviewer"))
+    for ident, parent, path in agents:
         file = directory / f"rollout-{ident}.jsonl"
-        source = "cli" if parent is None else {"subagent": {"thread_spawn": {"parent_thread_id": parent, "agent_path": path}}}
-        write_rollout(file, [session_meta(ident, source), turn(f"t-{ident}"), atomic(ident, f"t-{ident}", f"r-{ident}")])
+        source = (
+            "cli" if parent is None
+            else {"subagent": {"thread_spawn": {"parent_thread_id": parent, "agent_path": path}}}
+        )
+        write_rollout(file, [session_meta(ident, source), turn(f"t-{ident}"),
+                             atomic(ident, f"t-{ident}", f"r-{ident}")])
         rows.append(thread(ident, file, source=source, agent_path=path))
-        if parent: edges.append((parent, ident))
+        if parent:
+            edges.append((parent, ident))
     make_state(dashboard_settings.codex_home, rows, edges)
     ingest(dashboard_settings)
     with database(dashboard_settings.database, readonly=True) as conn:
@@ -120,7 +132,8 @@ def test_partial_final_line_becomes_complete(dashboard_settings):
     make_state(dashboard_settings.codex_home, [thread("root", path)])
     first = ingest(dashboard_settings)
     assert first.usage_records == 0
-    with path.open("a", encoding="utf-8") as handle: handle.write("\n")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
     second = ingest(dashboard_settings)
     assert second.usage_records == 1
 
@@ -144,7 +157,8 @@ def test_duplicate_source_event_response_id(dashboard_settings):
 
 def test_atomic_and_token_count_are_not_double_counted(dashboard_settings):
     values = usage_values()
-    setup_root(dashboard_settings, [session_meta("root"), turn("turn"), atomic("root", "turn", "r", values=values), token_count(values)])
+    setup_root(dashboard_settings, [session_meta("root"), turn("turn"),
+                                    atomic("root", "turn", "r", values=values), token_count(values)])
     ingest(dashboard_settings)
     assert count_usage(dashboard_settings)[0] == 1
 
